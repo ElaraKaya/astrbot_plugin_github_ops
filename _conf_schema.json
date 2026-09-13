@@ -1,0 +1,52 @@
+{
+  "github_token": {
+    "description": "Bot 自己的 GitHub PAT",
+    "type": "string",
+    "hint": "fine-grained PAT：Contents + Issues + Pull requests + Metadata。classic：repo。只填在这里，不要发到聊天里。",
+    "default": "",
+    "secret": true
+  },
+  "api_base": {
+    "description": "GitHub API 根地址",
+    "type": "string",
+    "hint": "GitHub.com 用默认值。GitHub Enterprise 才改。",
+    "default": "https://api.github.com"
+  },
+  "http_proxy": {
+    "description": "访问 GitHub API 的出口代理",
+    "type": "string",
+    "hint": "HTTP/SOCKS，例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080。留空走系统 HTTP(S)_PROXY。带账号别发到聊天里。SOCKS 需已装 socksio。",
+    "default": "",
+    "secret": true
+  },
+  "who_can_use": {
+    "description": "谁可以让 bot 动这个 GitHub 号",
+    "type": "string",
+    "hint": "admin=仅管理员；all=群里谁喊都可以（这个号就会被随便玩）。",
+    "options": ["admin", "all"],
+    "default": "admin"
+  },
+  "default_private": {
+    "description": "create_repo 默认私有",
+    "type": "bool",
+    "hint": "bot 自己玩建议保持私有，避免实验仓库公开出去。",
+    "default": true
+  },
+  "allow_delete_repo": {
+    "description": "允许 delete_repo",
+    "type": "bool",
+    "hint": "默认关。打开后模型可以删这个号下的仓库。",
+    "default": false
+  },
+  "allow_merge_pr": {
+    "description": "允许 merge_pr",
+    "type": "bool",
+    "default": true
+  },
+  "allowed_repos": {
+    "description": "可写仓库白名单",
+    "type": "list",
+    "hint": "空=只能写 bot 自己 login 下的仓。可填 login 或 owner/repo。fork 源仓、star、只读不受这项限制。",
+    "default": []
+  }
+}

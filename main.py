@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from contextvars import ContextVar
+from pathlib import Path
 from typing import Any
 
 from pydantic import Field
@@ -16,6 +18,7 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 
 from .github_client import GitHubClient, GitHubError, clip_text
 from .inner_tools import build_inner_tools, set_runner
+from .localfs import parse_local_root
 from .ops import (
     OUTER_TEXT_LIMIT,
     PATH_CHECKED_ACTIONS,
@@ -30,11 +33,13 @@ from .ops import (
 
 try:
     from astrbot.core.agent.tool import ToolSet
-except ImportError:
+except ImportError:  # pragma: no cover - fallback across AstrBot layouts
     try:
         from astrbot.core.provider.func_tool_manager import ToolSet
-    except ImportError:
+    except ImportError:  # pragma: no cover
         from astrbot.api.provider import ToolSet
+
+_local_root_var: ContextVar[Path | None] = ContextVar("github_ops_local_root", default=None)
 
 INNER_SYSTEM_PROMPT = (
     "只操作 bot 自己的 GitHub 号。用工具干活。"
@@ -44,13 +49,15 @@ INNER_SYSTEM_PROMPT = (
     "没要求就别把文件正文或 issue 全文丢回来。"
     "task 已自包含，不要假设还有聊天记录。"
     "fork 的 owner 是源仓；写入目标默认是 bot 自己的 login。"
+    "若已授予 local_dir：github_local 只能读这个目录；"
+    "推仓用 github_files 的 local_paths，不要把文件正文再抄一遍。"
 )
 
 TOOL_DESCRIPTION = (
     "Operate THIS BOT's own GitHub account (not the human user's). "
-    "Pass the whole job in task, including any file contents to commit. "
-    "Do not split into GitHub actions yourself. "
-    "Never print the token."
+    "Pass the whole job in task. For local source trees, pass local_dir "
+    "(absolute path) instead of file bodies. Do not split into GitHub "
+    "actions yourself. Never print the token."
 )
 
 
@@ -67,7 +74,7 @@ def _make_tool_set(tools: list[Any]) -> Any:
 @dataclass
 class GitHubOpsTool(FunctionTool[AstrAgentContext]):
     name: str = "github_ops"
-    description: TOOL_DESCRIPTION
+    description: str = TOOL_DESCRIPTION
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
@@ -76,10 +83,17 @@ class GitHubOpsTool(FunctionTool[AstrAgentContext]):
                     "type": "string",
                     "description": (
                         "Self-contained GitHub task for the bot's account. "
-                        "Include repo names and any file contents. "
+                        "Include repo names. Prefer local_dir over file bodies. "
                         "The inner loop cannot see QQ/chat history."
                     ),
-                }
+                },
+                "local_dir": {
+                    "type": "string",
+                    "description": (
+                        "Optional absolute directory the inner loop may read. "
+                        "Paths outside it are rejected. Use this to push local files."
+                    ),
+                },
             },
             "required": ["task"],
         }
@@ -94,7 +108,11 @@ class GitHubOpsTool(FunctionTool[AstrAgentContext]):
         if plugin is None:
             return "github_ops 未初始化"
         event = context.context.event
-        return await plugin.run_github_agent(event, str(kwargs.get("task") or ""))
+        return await plugin.run_github_agent(
+            event,
+            str(kwargs.get("task") or ""),
+            str(kwargs.get("local_dir") or ""),
+        )
 
 
 class GitHubOpsPlugin(Star):
@@ -220,9 +238,15 @@ class GitHubOpsPlugin(Star):
             default_private=bool(self.config.get("default_private", True)),
             allow_delete_repo=bool(self.config.get("allow_delete_repo", False)),
             allow_merge_pr=bool(self.config.get("allow_merge_pr", True)),
+            local_root=_local_root_var.get(),
         )
 
-    async def run_github_agent(self, event: AstrMessageEvent, task: str) -> str:
+    async def run_github_agent(
+        self,
+        event: AstrMessageEvent,
+        task: str,
+        local_dir: str = "",
+    ) -> str:
         if not self._allowed(event):
             return dumps({"error": "当前会话无权使用 bot 的 GitHub 号（who_can_use=admin）"})
         client = self._get_client()
@@ -230,50 +254,68 @@ class GitHubOpsPlugin(Star):
             return dumps({"error": "管理员还没在插件配置里填写 github_token"})
         task = (task or "").strip()
         if not task:
-            return dumps({"error": "task 为空。把完整 GitHub 任务（含文件内容）写进 task。"})
-
-        loop_kwargs: dict[str, Any] = {
-            "event": event,
-            "chat_provider_id": await self.context.get_current_chat_provider_id(
-                event.unified_msg_origin
-            ),
-            "prompt": task,
-            "system_prompt": INNER_SYSTEM_PROMPT,
-            "tools": _make_tool_set(build_inner_tools()),
-            "max_steps": 12,
-            "tool_call_timeout": 60,
-        }
-        try:
-            params = inspect.signature(self.context.tool_loop_agent).parameters
-        except (TypeError, ValueError):
-            params = {}
-        if "contexts" in params:
-            loop_kwargs["contexts"] = []
+            return dumps({"error": "task 为空。把完整 GitHub 任务写进 task。需要推本地文件就加 local_dir。"})
 
         try:
-            llm_resp = await self.context.tool_loop_agent(**loop_kwargs)
-        except TypeError as exc:
-            logger.warning(f"[github_ops] tool_loop_agent 参数不兼容，去掉 contexts 重试: {exc}")
-            loop_kwargs.pop("contexts", None)
+            local_root = parse_local_root(local_dir) if local_dir.strip() else None
+        except GitHubError as exc:
+            return dumps({"error": exc.message, "status": exc.status})
+
+        prompt = task
+        if local_root is not None:
+            prompt = (
+                f"{task}\n\n"
+                f"[granted local_dir={local_root}]\n"
+                "只读这个目录。推仓用 github_files local_paths，不要抄文件正文。"
+            )
+
+        token = _local_root_var.set(local_root)
+        try:
+            loop_kwargs: dict[str, Any] = {
+                "event": event,
+                "chat_provider_id": await self.context.get_current_chat_provider_id(
+                    event.unified_msg_origin
+                ),
+                "prompt": prompt,
+                "system_prompt": INNER_SYSTEM_PROMPT,
+                "tools": _make_tool_set(build_inner_tools()),
+                "max_steps": 12,
+                "tool_call_timeout": 60,
+            }
+            try:
+                params = inspect.signature(self.context.tool_loop_agent).parameters
+            except (TypeError, ValueError):
+                params = {}
+            if "contexts" in params:
+                loop_kwargs["contexts"] = []
+
             try:
                 llm_resp = await self.context.tool_loop_agent(**loop_kwargs)
-            except Exception as exc2:
-                logger.error(f"[github_ops] 子循环失败: {exc2}")
-                return dumps({"error": "github 子循环失败", "detail": type(exc2).__name__})
-        except Exception as exc:
-            logger.error(f"[github_ops] 子循环失败: {exc}")
-            return dumps({"error": "github 子循环失败", "detail": type(exc).__name__})
+            except TypeError as exc:
+                logger.warning(f"[github_ops] tool_loop_agent 参数不兼容，去掉 contexts 重试: {exc}")
+                loop_kwargs.pop("contexts", None)
+                try:
+                    llm_resp = await self.context.tool_loop_agent(**loop_kwargs)
+                except Exception as exc2:
+                    logger.error(f"[github_ops] 子循环失败: {exc2}")
+                    return dumps({"error": "github 子循环失败", "detail": type(exc2).__name__})
+            except Exception as exc:
+                logger.error(f"[github_ops] 子循环失败: {exc}")
+                return dumps({"error": "github 子循环失败", "detail": type(exc).__name__})
 
-        text = ""
-        if llm_resp is not None:
-            text = str(getattr(llm_resp, "completion_text", None) or "")
-        if not text.strip():
-            return dumps({"error": "子循环没有返回文本"})
-        return clip_text(text.strip(), OUTER_TEXT_LIMIT)
+            text = ""
+            if llm_resp is not None:
+                text = str(getattr(llm_resp, "completion_text", None) or "")
+            if not text.strip():
+                return dumps({"error": "子循环没有返回文本"})
+            return clip_text(text.strip(), OUTER_TEXT_LIMIT)
+        finally:
+            _local_root_var.reset(token)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("github")
     async def github_cmd(self, event: AstrMessageEvent, sub: str = "status"):
+        """查看 bot GitHub 号状态。子命令: status / whoami / actions"""
         sub = (sub or "status").strip().lower()
         if sub == "actions":
             yield event.plain_result(help_text())

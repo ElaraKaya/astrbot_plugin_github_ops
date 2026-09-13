@@ -3,9 +3,17 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from .github_client import GitHubClient, GitHubError, clip_text
+from .localfs import (
+    as_path_list,
+    collect_local_files,
+    is_blocked_path,
+    list_local_entries,
+    read_local_file,
+)
 
 ACTIONS = (
     "whoami",
@@ -13,6 +21,8 @@ ACTIONS = (
     "get_repo",
     "create_repo",
     "delete_repo",
+    "list_local",
+    "get_local",
     "list_files",
     "get_file",
     "put_file",
@@ -30,6 +40,7 @@ ACTIONS = (
     "merge_pr",
     "star_repo",
 )
+
 
 INNER_TEXT_LIMIT = 2000
 OUTER_TEXT_LIMIT = 1500
@@ -49,7 +60,9 @@ WRITE_ACTIONS = frozenset(
     }
 )
 
-PATH_CHECKED_ACTIONS = frozenset({"list_files", "get_file", "put_file", "push_files"})
+PATH_CHECKED_ACTIONS = frozenset(
+    {"list_files", "get_file", "put_file", "push_files", "list_local", "get_local"}
+)
 
 GROUP_ACTION_MAP = {
     "github_repo": {
@@ -58,6 +71,10 @@ GROUP_ACTION_MAP = {
         "create": "create_repo",
         "delete": "delete_repo",
         "commits": "list_commits",
+    },
+    "github_local": {
+        "list": "list_local",
+        "get": "get_local",
     },
     "github_files": {
         "list": "list_files",
@@ -84,45 +101,8 @@ GROUP_ACTION_MAP = {
     },
 }
 
-_BLOCKED_NAMES = {
-    ".env",
-    ".env.local",
-    ".env.production",
-    ".env.development",
-    "id_rsa",
-    "id_ecdsa",
-    "id_ed25519",
-    "id_dsa",
-    ".netrc",
-    ".git-credentials",
-    "credentials",
-    "credentials.json",
-    "authorized_keys",
-}
-_BLOCKED_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".kdbx")
-_ENV_ALLOW = {".env.example", ".env.sample"}
-
-
 def dumps(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-
-
-def is_blocked_path(path: str) -> bool:
-    norm = (path or "").replace("\\", "/").strip()
-    while norm.startswith("./"):
-        norm = norm[2:]
-    norm = norm.lstrip("/")
-    lower = norm.lower()
-    if ".git/config" in lower:
-        return True
-    name = lower.rsplit("/", 1)[-1]
-    if name in _ENV_ALLOW:
-        return False
-    if name in _BLOCKED_NAMES:
-        return True
-    if name == ".env" or name.startswith(".env."):
-        return True
-    return any(name.endswith(suf) for suf in _BLOCKED_SUFFIXES)
 
 
 def blocked_paths_in(kwargs: dict[str, Any]) -> list[str]:
@@ -130,6 +110,9 @@ def blocked_paths_in(kwargs: dict[str, Any]) -> list[str]:
     path = str(kwargs.get("path") or "").strip()
     if path and is_blocked_path(path):
         found.append(path)
+    local_path = str(kwargs.get("local_path") or "").strip()
+    if local_path and is_blocked_path(local_path):
+        found.append(local_path)
     try:
         files = _as_files(
             kwargs.get("files") if kwargs.get("files") not in (None, "") else kwargs.get("files_json")
@@ -140,6 +123,12 @@ def blocked_paths_in(kwargs: dict[str, Any]) -> list[str]:
         p = item.get("path") or ""
         if p and is_blocked_path(p):
             found.append(p)
+    try:
+        for p in as_path_list(kwargs.get("local_paths") or kwargs.get("paths")):
+            if p and is_blocked_path(p):
+                found.append(p)
+    except GitHubError:
+        pass
     return found
 
 
@@ -217,6 +206,18 @@ def _as_files(value: Any) -> list[dict[str, str]]:
     return out
 
 
+def _load_local_files(local_root: Path | None, kwargs: dict[str, Any]) -> list[dict[str, str]]:
+    paths = as_path_list(kwargs.get("local_paths") or kwargs.get("paths"))
+    local_path = str(kwargs.get("local_path") or "").strip()
+    if local_path:
+        paths.append(local_path)
+    if not paths:
+        return []
+    if local_root is None:
+        raise GitHubError(400, "未授予 local_dir，不能读本地文件")
+    return collect_local_files(local_root, paths)
+
+
 async def dispatch(
     client: GitHubClient,
     action: str,
@@ -225,6 +226,7 @@ async def dispatch(
     default_private: bool,
     allow_delete_repo: bool,
     allow_merge_pr: bool,
+    local_root: Path | None = None,
 ) -> str:
     action = (action or "").strip()
     if action not in ACTIONS:
@@ -255,8 +257,16 @@ async def dispatch(
     page = _as_int(kwargs.get("page"), 1) or 1
     private = _as_bool(kwargs.get("private"), default_private)
     files = _as_files(kwargs.get("files") if kwargs.get("files") not in (None, "") else kwargs.get("files_json"))
+    local_files: list[dict[str, str]] = []
 
     try:
+        local_files = _load_local_files(local_root, kwargs)
+        if local_files:
+            files = local_files + files
+        if action == "push_files" and not files:
+            if local_root is None:
+                raise GitHubError(400, "push 需要 files 或 local_paths")
+            files = collect_local_files(local_root, [""])
         if action == "whoami":
             return dumps(await client.whoami())
         if action == "list_repos":
@@ -286,6 +296,14 @@ async def dispatch(
             if not allow_delete_repo:
                 return dumps({"error": "已禁止删除仓库。管理员可在插件配置里打开 allow_delete_repo。"})
             return dumps(await client.delete_repo(owner, repo))
+        if action == "list_local":
+            if local_root is None:
+                raise GitHubError(400, "未授予 local_dir")
+            return dumps(list_local_entries(local_root, path))
+        if action == "get_local":
+            if local_root is None:
+                raise GitHubError(400, "未授予 local_dir")
+            return dumps(read_local_file(local_root, path, INNER_TEXT_LIMIT))
         if action == "list_files":
             return dumps(await client.list_files(owner, repo, path=path, ref=branch))
         if action == "get_file":
@@ -294,6 +312,10 @@ async def dispatch(
                 data["content"] = clip_text(data["content"], INNER_TEXT_LIMIT)
             return dumps(data)
         if action == "put_file":
+            if local_files:
+                item = local_files[0]
+                path = path or item["path"]
+                content = item["content"]
             return dumps(
                 await client.put_file(
                     owner,
@@ -384,8 +406,9 @@ async def dispatch(
 
 def help_text() -> str:
     return (
-        "主对话只调 github_ops(task=完整任务)。"
-        " 子循环工具: github_whoami, github_repo, github_files, "
+        "主对话只调 github_ops(task=完整任务, local_dir=可选绝对路径)。"
+        " 子循环工具: github_whoami, github_repo, github_local, github_files, "
         "github_issue, github_pr, github_misc。"
+        " 有 local_dir 就推本地路径，不要抄文件正文。"
         " 默认 owner 是 bot 自己的 GitHub 登录名。不要输出 token。"
     )

@@ -36,6 +36,21 @@
 
 失败：只建了空仓没文件；模型说「请再说一次」；task 里没有 README 正文（子循环看不到 QQ 历史）。
 
+## 2b. 本地目录推仓（不抄正文）
+
+准备一个只有几个文本文件的目录，例如 `/tmp/ab-ops-local`（含 `README.md`，不要放 `.env`）。
+
+> 把 `/tmp/ab-ops-local` 推到你自己的 private 仓 `ab-ops-local`，不要把文件正文贴进 task。
+
+过：
+
+- 外层调用是 `github_ops(task=..., local_dir=/tmp/ab-ops-local)`，task 里没有文件全文。
+- 子循环用 `github_files` 的 `local_paths`（或省略后推整个 granted 目录），不要再生成 `files[].content`。
+- 读 `../`、`/etc/passwd`、`.env` 都被拒。
+- GitHub 上出现对应文本文件；`.env` / `__pycache__` / 二进制不在仓里。
+
+失败：task 里又被塞进全文；越界路径被读到；仓里出现密钥文件。
+
 ## 3. 子循环不要污染下一轮
 
 接着发：「随便聊聊天气」。

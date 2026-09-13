@@ -82,11 +82,43 @@ class GitHubRepoTool(FunctionTool[AstrAgentContext]):
 
 
 @dataclass
+class GitHubLocalTool(FunctionTool[AstrAgentContext]):
+    name: str = "github_local"
+    description: str = (
+        "Read the granted local_dir only. action=list|get. "
+        "Paths must stay under that directory. No file body in GitHub writes; "
+        "use github_files local_paths to push."
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "list | get",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Relative path under the granted local_dir.",
+                },
+            },
+            "required": ["action"],
+        }
+    )
+
+    async def call(
+        self, context: ContextWrapper[AstrAgentContext], **kwargs
+    ) -> ToolExecResult:
+        return await _run("github_local", kwargs)
+
+
+@dataclass
 class GitHubFilesTool(FunctionTool[AstrAgentContext]):
     name: str = "github_files"
     description: str = (
         "Read or write files in a repo. action=list|get|put|push. "
-        "put=one file; push=multiple files in one commit via files[]."
+        "Prefer local_paths from the granted local_dir; do not paste file bodies. "
+        "put=one inline file; push=files[] or local_paths."
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -99,12 +131,24 @@ class GitHubFilesTool(FunctionTool[AstrAgentContext]):
                 "repo": {"type": "string", "description": "Repo name or owner/repo."},
                 "owner": {"type": "string", "description": "Owner. Omit for bot login."},
                 "path": {"type": "string", "description": "File or directory path."},
-                "content": {"type": "string", "description": "File text for put."},
+                "content": {
+                    "type": "string",
+                    "description": "Inline text for put. Skip if using local_path.",
+                },
+                "local_path": {
+                    "type": "string",
+                    "description": "Relative path under granted local_dir for put.",
+                },
+                "local_paths": {
+                    "type": "array",
+                    "description": "push: relative files or dirs under granted local_dir.",
+                    "items": {"type": "string"},
+                },
                 "message": {"type": "string", "description": "Commit message."},
                 "branch": {"type": "string", "description": "Branch or ref."},
                 "files": {
                     "type": "array",
-                    "description": "push: [{path, content}, ...]",
+                    "description": "push: [{path, content}, ...] only if no local_paths.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -225,6 +269,7 @@ def build_inner_tools() -> list[FunctionTool[AstrAgentContext]]:
     return [
         GitHubWhoamiTool(),
         GitHubRepoTool(),
+        GitHubLocalTool(),
         GitHubFilesTool(),
         GitHubIssueTool(),
         GitHubPrTool(),

@@ -1,6 +1,6 @@
 {
   "github_token": {
-    "description": "Bot 自己的 GitHub PAT",
+    "description": "GitHub 个人访问令牌 (PAT)",
     "type": "string",
     "hint": "fine-grained PAT：Contents + Issues + Pull requests + Metadata。classic：repo。只填在这里，不要发到聊天里。",
     "default": "",

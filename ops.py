@@ -410,5 +410,5 @@ def help_text() -> str:
         " 子循环工具: github_whoami, github_repo, github_local, github_files, "
         "github_issue, github_pr, github_misc。"
         " 有 local_dir 就推本地路径，不要抄文件正文。"
-        " 默认 owner 是 bot 自己的 GitHub 登录名。不要输出 token。"
+        " 默认 owner 为当前登录的 GitHub 账号。严禁输出 token。"
     )

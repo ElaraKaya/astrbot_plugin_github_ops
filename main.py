@@ -42,19 +42,19 @@ except ImportError:  # pragma: no cover - fallback across AstrBot layouts
 _local_root_var: ContextVar[Path | None] = ContextVar("github_ops_local_root", default=None)
 
 INNER_SYSTEM_PROMPT = (
-    "只操作 bot 自己的 GitHub 号。用工具干活。"
-    "先 github_whoami 再写。"
+    "执行 GitHub 相关任务。用工具干活。"
+    "先 github_whoami 确认身份再写。"
     "只回摘要和 html_url。"
-    "不准打 token / PAT / Authorization。"
+    "严禁输出 token / PAT / Authorization。"
     "没要求就别把文件正文或 issue 全文丢回来。"
     "task 已自包含，不要假设还有聊天记录。"
-    "fork 的 owner 是源仓；写入目标默认是 bot 自己的 login。"
+    "fork 的 owner 是源仓；写入目标默认是当前登录账号。"
     "若已授予 local_dir：github_local 只能读这个目录；"
     "推仓用 github_files 的 local_paths，不要把文件正文再抄一遍。"
 )
 
 TOOL_DESCRIPTION = (
-    "Operate THIS BOT's own GitHub account (not the human user's). "
+    "Execute GitHub tasks with configured GitHub account. "
     "Pass the whole job in task. For local source trees, pass local_dir "
     "(absolute path) instead of file bodies. Do not split into GitHub "
     "actions yourself. Never print the token."
@@ -228,7 +228,7 @@ class GitHubOpsPlugin(Star):
                         "error": "写入目标不在白名单",
                         "owner": owner or login,
                         "repo": repo,
-                        "hint": "allowed_repos 为空时只能写 bot 自己的 login",
+                        "hint": "allowed_repos 为空时只能写入当前登录账号下的仓库",
                     }
                 )
         return await dispatch(
@@ -248,10 +248,10 @@ class GitHubOpsPlugin(Star):
         local_dir: str = "",
     ) -> str:
         if not self._allowed(event):
-            return dumps({"error": "当前会话无权使用 bot 的 GitHub 号（who_can_use=admin）"})
+            return dumps({"error": "无权调用 GitHub 功能（权限受限：who_can_use=admin）"})
         client = self._get_client()
         if not client.configured:
-            return dumps({"error": "管理员还没在插件配置里填写 github_token"})
+            return dumps({"error": "管理员尚未配置 github_token"})
         task = (task or "").strip()
         if not task:
             return dumps({"error": "task 为空。把完整 GitHub 任务写进 task。需要推本地文件就加 local_dir。"})
@@ -315,14 +315,14 @@ class GitHubOpsPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("github")
     async def github_cmd(self, event: AstrMessageEvent, sub: str = "status"):
-        """查看 bot GitHub 号状态。子命令: status / whoami / actions"""
+        """查看 GitHub 账号状态。子命令: status / whoami / actions"""
         sub = (sub or "status").strip().lower()
         if sub == "actions":
             yield event.plain_result(help_text())
             return
         client = self._get_client()
         if not client.configured:
-            yield event.plain_result("还没填 github_token。到 WebUI 插件配置里贴 bot 自己的 PAT。")
+            yield event.plain_result("尚未配置 github_token。请在 WebUI 插件配置中填写 PAT。")
             return
         try:
             me = await client.whoami()
@@ -334,7 +334,7 @@ class GitHubOpsPlugin(Star):
             return
         rate = me.get("rate_limit") or {}
         yield event.plain_result(
-            "bot GitHub 号: {login}\n"
+            "GitHub 账号: {login}\n"
             "主页: {url}\n"
             "public_repos: {pub}  private_repos: {priv}\n"
             "API remaining: {remain}/{limit}\n"

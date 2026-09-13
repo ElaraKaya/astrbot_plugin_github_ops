@@ -1,0 +1,13 @@
+name: astrbot_plugin_github_ops
+display_name: GitHub Ops
+desc: >
+  主对话只挂 github_ops。建仓、提交、issue、fork、PR 走 REST 子循环，
+  不把官方 GitHub MCP 灌进上下文。
+version: 0.3.0
+author: Elara
+repo: https://github.com/ElaraKaya/astrbot_plugin_github_ops
+astrbot_version: ">=4.5.7"
+tags:
+  - github
+  - tool
+  - skill

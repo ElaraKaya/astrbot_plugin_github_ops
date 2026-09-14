@@ -23,7 +23,10 @@
     "description": "谁可以让 bot 动这个 GitHub 号",
     "type": "string",
     "hint": "admin=仅管理员；all=群里谁喊都可以（这个号就会被随便玩）。",
-    "options": ["admin", "all"],
+    "options": [
+      "admin",
+      "all"
+    ],
     "default": "admin"
   },
   "default_private": {
@@ -48,5 +51,17 @@
     "type": "list",
     "hint": "空=只能写 bot 自己 login 下的仓。可填 login 或 owner/repo。fork 源仓、star、只读不受这项限制。",
     "default": []
+  },
+  "git_committer_name": {
+    "description": "Git 提交者显示名称",
+    "type": "string",
+    "hint": "会出现在公开 commit 里。留空则用当前 GitHub 账号的 login。",
+    "default": ""
+  },
+  "git_committer_email": {
+    "description": "Git 提交者邮箱",
+    "type": "string",
+    "hint": "会出现在公开 commit 里。留空则自动用 {id}+{login}@users.noreply.github.com，避免泄露私人邮箱。填了就按填写值提交，请不要填 QQ/Gmail 等私人邮箱。",
+    "default": ""
   }
 }

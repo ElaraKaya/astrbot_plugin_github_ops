@@ -25,10 +25,13 @@
    - `github_misc`：辅助协作操作（fork / star / branch）
 
 4. **安全护栏机制**
+   - **身份防泄露**：提交默认强制使用 GitHub 官方隐私邮箱格式 `{id}+{login}@users.noreply.github.com`，避免在 public commit 中暴露个人主邮箱；新建仓库 `auto_init=False`，首条 commit 由插件通过 Contents API 注入受控身份。
    - **权限审查**：配置 `who_can_use`（默认仅 admin 可触发），无权会话立即拦截；
    - **写入白名单**：`allowed_repos` 严格限制写操作目标，默认仅允许写入当前凭证所属账号；
-   - **敏感文件拦截**：自动拦截 `.env`、`id_rsa`、`credentials`、`*.pem` 等敏感密钥提交与读取；
-   - **Token 防泄漏**：内层 Prompt 强约束与外层脱敏过滤，严禁在日志与模型回复中暴露 Token。
+   - **敏感路径拦截**：自动拦截 `.env`、`id_rsa`、`credentials`、`*.pem` 等敏感密钥路径提交与读取；
+   - **正文凭据扫描**：提交前深度扫描文件内容、commit message、PR / Issue 标题与正文中的 PAT、API Key、私钥以及当前账号绑定的私人邮箱，命中则拒绝写入；
+   - **输出硬脱敏**：子循环内层工具返回、最终回复及异常日志统一经过 `redact_text` 过滤脱敏，防止 Token 或代理凭据回显。
+   - **已知限制**：`merge_pr` 产生的 merge/squash commit 身份由 GitHub Merge API 决定。
 
 ## 安装
 
@@ -48,6 +51,8 @@ PAT 建议权限：
 | github_token | 空 | GitHub 个人访问令牌 (PAT) |
 | api_base | `https://api.github.com` | GitHub API 基础 URL，GHE 场景可按需修改 |
 | http_proxy | 空 | 出口代理地址。留空走系统环境变量 `HTTP(S)_PROXY` |
+| git_committer_name | 空 | Git 提交者显示名称。留空使用账号 login |
+| git_committer_email | 空 | Git 提交者邮箱。留空自动使用 `{id}+{login}@users.noreply.github.com` 保护隐私 |
 | who_can_use | admin | 权限控制：`admin` 仅管理员；`all` 所有人可用 |
 | default_private | true | 新建仓库默认设置为私有 |
 | allow_delete_repo | false | 是否允许执行删仓操作 |

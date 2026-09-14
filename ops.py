@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from .github_client import GitHubClient, GitHubError, clip_text
+
+try:
+    from .redact import find_secret, redact_text
+except ImportError:
+    from redact import find_secret, redact_text
 from .localfs import (
     as_path_list,
     collect_local_files,
@@ -263,10 +268,38 @@ async def dispatch(
         local_files = _load_local_files(local_root, kwargs)
         if local_files:
             files = local_files + files
+        if action == "put_file" and local_files:
+            item = local_files[0]
+            path = path or item.get("path", "")
+            content = item.get("content", "")
         if action == "push_files" and not files:
             if local_root is None:
                 raise GitHubError(400, "push 需要 files 或 local_paths")
             files = collect_local_files(local_root, [""])
+
+        # 写入前敏感信息扫描
+        needles = [getattr(client, "_profile_email", "")] if getattr(client, "_profile_email", "") else None
+        tok = getattr(client, "_token", "") if getattr(client, "configured", False) else ""
+
+        for field_label, val in [("message", message), ("title", title), ("body", body), ("description", description)]:
+            if val:
+                sec_err = find_secret(val, token=tok, extra_needles=needles)
+                if sec_err:
+                    return dumps({"error": f"{field_label}: {sec_err}", "action": action})
+
+        if action == "put_file":
+            sec_err = find_secret(content, token=tok, extra_needles=needles)
+            if sec_err:
+                return dumps({"error": f"文件 {path}: {sec_err}", "action": action})
+
+        if action in ("push_files", "create_repo"):
+            for f_item in files:
+                f_path = str(f_item.get("path") or "")
+                f_content = str(f_item.get("content") or "")
+                sec_err = find_secret(f_content, token=tok, extra_needles=needles)
+                if sec_err:
+                    return dumps({"error": f"文件 {f_path}: {sec_err}", "action": action})
+
         if action == "whoami":
             return dumps(await client.whoami())
         if action == "list_repos":
@@ -279,18 +312,18 @@ async def dispatch(
                 name,
                 description=description,
                 private=bool(private),
-                auto_init=True,
+                auto_init=False,
             )
-            if files:
-                login = created.get("full_name") or ""
-                c_owner, c_repo = login.split("/", 1) if "/" in login else (owner, name)
-                pushed = await client.push_files(
-                    c_owner,
-                    c_repo,
-                    files,
-                    message or "init files",
-                )
-                created["pushed"] = pushed
+            to_push = files if files else [{"path": "README.md", "content": f"# {name}\n"}]
+            login = created.get("full_name") or ""
+            c_owner, c_repo = login.split("/", 1) if "/" in login else (owner, name)
+            pushed = await client.push_files(
+                c_owner,
+                c_repo,
+                to_push,
+                message or "init files",
+            )
+            created["pushed"] = pushed
             return dumps(created)
         if action == "delete_repo":
             if not allow_delete_repo:
@@ -312,10 +345,6 @@ async def dispatch(
                 data["content"] = clip_text(data["content"], INNER_TEXT_LIMIT)
             return dumps(data)
         if action == "put_file":
-            if local_files:
-                item = local_files[0]
-                path = path or item["path"]
-                content = item["content"]
             return dumps(
                 await client.put_file(
                     owner,
@@ -397,9 +426,11 @@ async def dispatch(
         if action == "star_repo":
             return dumps(await client.star_repo(owner, repo))
     except GitHubError as exc:
-        return dumps({"error": exc.message, "status": exc.status, "action": action})
+        err_msg = redact_text(exc.message, token=tok, extra_needles=needles)
+        return dumps({"error": err_msg, "status": exc.status, "action": action})
     except Exception as exc:
-        return dumps({"error": f"{type(exc).__name__}: {exc}", "action": action})
+        err_msg = redact_text(f"{type(exc).__name__}: {exc}", token=tok, extra_needles=needles)
+        return dumps({"error": err_msg, "action": action})
 
     return dumps({"error": "未处理的 action", "action": action})
 

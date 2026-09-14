@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import json
 import sys
@@ -8,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import github_client as gc  # noqa: E402
+import redact  # noqa: E402
 
 
 def _load_module(name: str, filename: str, extras: dict | None = None):
@@ -17,6 +19,7 @@ def _load_module(name: str, filename: str, extras: dict | None = None):
         pkg.__path__ = [str(ROOT)]
         sys.modules["astrbot_plugin_github_ops"] = pkg
     sys.modules["astrbot_plugin_github_ops.github_client"] = gc
+    sys.modules["astrbot_plugin_github_ops.redact"] = redact
     if extras:
         sys.modules.update(extras)
     spec = importlib.util.spec_from_file_location(
@@ -36,7 +39,14 @@ def _load_localfs():
 
 def _load_ops():
     localfs = _load_localfs()
-    return _load_module("ops", "ops.py", {"astrbot_plugin_github_ops.localfs": localfs})
+    return _load_module(
+        "ops",
+        "ops.py",
+        {
+            "astrbot_plugin_github_ops.localfs": localfs,
+            "astrbot_plugin_github_ops.redact": redact,
+        },
+    )
 
 
 def test_redact_proxy() -> None:
@@ -64,6 +74,68 @@ def test_clip_and_brief() -> None:
         }
     )
     assert brief["full_name"] == "bot/toy"
+
+
+def test_commit_author_identity() -> None:
+    # 1. With login and id (default noreply)
+    c1 = gc.GitHubClient("tok")
+    c1._login = "elara"
+    c1._id = 987654
+    assert c1.get_commit_author() == {
+        "name": "elara",
+        "email": "987654+elara@users.noreply.github.com",
+    }
+
+    # 2. Fallback without id
+    c2 = gc.GitHubClient("tok")
+    c2._login = "elara"
+    c2._id = None
+    assert c2.get_commit_author() == {
+        "name": "elara",
+        "email": "elara@users.noreply.github.com",
+    }
+
+    # 3. Custom committer name and email
+    c3 = gc.GitHubClient("tok", committer_name="CustomDev", committer_email="dev@custom.org")
+    c3._login = "elara"
+    c3._id = 987654
+    assert c3.get_commit_author() == {
+        "name": "CustomDev",
+        "email": "dev@custom.org",
+    }
+
+    # 4. _client_key differentiation logic
+    def make_key(token, api_base, proxy, name, email):
+        return (token, api_base, proxy, name, email)
+
+    k1 = make_key("tok", "base", "", "", "")
+    k2 = make_key("tok", "base", "", "custom", "")
+    assert k1 != k2
+
+
+def test_redact_module() -> None:
+    # Exact token match
+    assert redact.find_secret("my secret tok_12345", token="tok_12345") is not None
+    # Extra needles (e.g. profile email)
+    assert redact.find_secret("contact user@private.com", extra_needles=["user@private.com"]) is not None
+    # Allowed ordinary QQ email
+    assert redact.find_secret("contact 1234567@qq.com") is None
+    # Allowed short sk-
+    assert redact.find_secret("sk-12345") is None
+
+    # Secret patterns
+    assert redact.find_secret("ghp_" + "A" * 30) is not None
+    assert redact.find_secret("github_pat_" + "1" * 30) is not None
+    assert redact.find_secret("-" * 5 + "BEGIN PRIVATE KEY" + "-" * 5 + "\nMIIE...") is not None
+    assert redact.find_secret("-" * 5 + "BEGIN OPENSSH PRIVATE KEY" + "-" * 5 + "\n...") is not None
+
+    # redact_text
+    raw = "Auth: " + ("ghp_" + "1" * 25) + " and user@private.com and ok"
+    cleaned = redact.redact_text(raw, token="", extra_needles=["user@private.com"])
+    assert "ghp_" not in cleaned
+    assert "user@private.com" not in cleaned
+    assert "[REDACTED]" in cleaned
+    assert "and ok" in cleaned
 
 
 def test_ops_guards() -> None:
@@ -104,6 +176,91 @@ def test_ops_guards() -> None:
     )
     dumped = ops.dumps({"a": 1})
     assert "\n" not in dumped
+
+
+def test_ops_dispatch_secret_scanning() -> None:
+    ops = _load_ops()
+    client = gc.GitHubClient("fake_token_12345")
+    client._profile_email = "my_private@secret.com"
+
+    # 1. Block put_file with token or sensitive text
+    res = asyncio.run(
+        ops.dispatch(
+            client,
+            "put_file",
+            {"owner": "bot", "repo": "toy", "path": "file.txt", "content": "key is fake_token_12345"},
+            default_private=True,
+            allow_delete_repo=False,
+            allow_merge_pr=True,
+        )
+    )
+    data = json.loads(res)
+    assert "error" in data and "文件 file.txt" in data["error"]
+
+    # 2. Block push_files with profile_email
+    res = asyncio.run(
+        ops.dispatch(
+            client,
+            "push_files",
+            {
+                "owner": "bot",
+                "repo": "toy",
+                "files": [{"path": "a.txt", "content": "contact my_private@secret.com"}],
+                "message": "push",
+            },
+            default_private=True,
+            allow_delete_repo=False,
+            allow_merge_pr=True,
+        )
+    )
+    data = json.loads(res)
+    assert "error" in data and "文件 a.txt" in data["error"]
+
+    # 3. Block create_repo with secret in message/title/description or files
+    res = asyncio.run(
+        ops.dispatch(
+            client,
+            "create_repo",
+            {
+                "name": "newrepo",
+                "description": "repo with " + ("ghp_" + "1" * 25),
+            },
+            default_private=True,
+            allow_delete_repo=False,
+            allow_merge_pr=True,
+        )
+    )
+    data = json.loads(res)
+    assert "error" in data and "description" in data["error"]
+
+    # 4. Message secret scanning
+    res = asyncio.run(
+        ops.dispatch(
+            client,
+            "put_file",
+            {"owner": "bot", "repo": "toy", "path": "file.txt", "content": "clean", "message": "commit " + ("ghp_" + "1" * 25)},
+            default_private=True,
+            allow_delete_repo=False,
+            allow_merge_pr=True,
+        )
+    )
+    data = json.loads(res)
+    assert "error" in data and "message" in data["error"]
+
+    # 5. Normal QQ email should pass dispatch check (will fail at network since fake token, caught cleanly)
+    res = asyncio.run(
+        ops.dispatch(
+            client,
+            "put_file",
+            {"owner": "bot", "repo": "toy", "path": "file.txt", "content": "email: 123456@qq.com"},
+            default_private=True,
+            allow_delete_repo=False,
+            allow_merge_pr=True,
+        )
+    )
+    data = json.loads(res)
+    # Shouldn't fail with secret detection error
+    assert "检测到" not in data.get("error", "")
 
 
 def test_localfs_sandbox(tmp_path: Path | None = None) -> None:
@@ -178,6 +335,9 @@ def test_localfs_sandbox(tmp_path: Path | None = None) -> None:
 if __name__ == "__main__":
     test_redact_proxy()
     test_clip_and_brief()
+    test_commit_author_identity()
+    test_redact_module()
     test_ops_guards()
+    test_ops_dispatch_secret_scanning()
     test_localfs_sandbox()
-    print("all passed")
+    print("ALL TESTS PASSED SUCCESSFULLY!")

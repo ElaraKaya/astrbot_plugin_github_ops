@@ -17,6 +17,11 @@ from astrbot.core.agent.tool import FunctionTool, ToolExecResult
 from astrbot.core.astr_agent_context import AstrAgentContext
 
 from .github_client import GitHubClient, GitHubError, clip_text
+
+try:
+    from .redact import extract_proxy_credentials, redact_text
+except ImportError:
+    from redact import extract_proxy_credentials, redact_text
 from .inner_tools import build_inner_tools, set_runner
 from .localfs import parse_local_root
 from .ops import (
@@ -46,6 +51,7 @@ INNER_SYSTEM_PROMPT = (
     "先 github_whoami 确认身份再写。"
     "只回摘要和 html_url。"
     "严禁输出 token / PAT / Authorization。"
+    "工具若返回 [REDACTED] 不要试图还原。"
     "没要求就别把文件正文或 issue 全文丢回来。"
     "task 已自包含，不要假设还有聊天记录。"
     "fork 的 owner 是源仓；写入目标默认是当前登录账号。"
@@ -155,15 +161,31 @@ class GitHubOpsPlugin(Star):
         token = str(self.config.get("github_token") or "").strip()
         api_base = str(self.config.get("api_base") or "https://api.github.com").strip()
         proxy = str(self.config.get("http_proxy") or "").strip()
-        key = (token, api_base, proxy)
+        name = str(self.config.get("git_committer_name") or "").strip()
+        email = str(self.config.get("git_committer_email") or "").strip()
+        key = (token, api_base, proxy, name, email)
         if self._client is not None and self._client_key == key:
             return self._client
         old = self._client
-        self._client = GitHubClient(token, api_base=api_base, proxy=proxy)
+        self._client = GitHubClient(
+            token,
+            api_base=api_base,
+            proxy=proxy,
+            committer_name=name,
+            committer_email=email,
+        )
         self._client_key = key
         if old is not None:
             asyncio.create_task(old.aclose())
         return self._client
+
+    def _get_extra_needles(self, client: GitHubClient) -> list[str]:
+        proxy = str(self.config.get("http_proxy") or "").strip()
+        needles = extract_proxy_credentials(proxy)
+        profile_email = getattr(client, "_profile_email", "")
+        if profile_email:
+            needles.append(profile_email)
+        return needles
 
     def _who_can_use(self) -> str:
         value = str(self.config.get("who_can_use") or "admin").strip().lower()
@@ -231,7 +253,7 @@ class GitHubOpsPlugin(Star):
                         "hint": "allowed_repos 为空时只能写入当前登录账号下的仓库",
                     }
                 )
-        return await dispatch(
+        res = await dispatch(
             client,
             action,
             kwargs,
@@ -239,6 +261,11 @@ class GitHubOpsPlugin(Star):
             allow_delete_repo=bool(self.config.get("allow_delete_repo", False)),
             allow_merge_pr=bool(self.config.get("allow_merge_pr", True)),
             local_root=_local_root_var.get(),
+        )
+        return redact_text(
+            res,
+            token=client._token,
+            extra_needles=self._get_extra_needles(client),
         )
 
     async def run_github_agent(
@@ -308,7 +335,12 @@ class GitHubOpsPlugin(Star):
                 text = str(getattr(llm_resp, "completion_text", None) or "")
             if not text.strip():
                 return dumps({"error": "子循环没有返回文本"})
-            return clip_text(text.strip(), OUTER_TEXT_LIMIT)
+            redacted_text = redact_text(
+                text.strip(),
+                token=client._token,
+                extra_needles=self._get_extra_needles(client),
+            )
+            return clip_text(redacted_text, OUTER_TEXT_LIMIT)
         finally:
             _local_root_var.reset(token)
 
@@ -339,6 +371,7 @@ class GitHubOpsPlugin(Star):
             "public_repos: {pub}  private_repos: {priv}\n"
             "API remaining: {remain}/{limit}\n"
             "proxy: {proxy}\n"
+            "committer: {committer}\n"
             "who_can_use: {who}\n"
             "allowed_repos: {allow}".format(
                 login=me.get("login"),
@@ -348,6 +381,7 @@ class GitHubOpsPlugin(Star):
                 remain=rate.get("remaining"),
                 limit=rate.get("limit"),
                 proxy=client.proxy_display() or "(空=环境变量 HTTP(S)_PROXY)",
+                committer=f"{client.get_commit_author()['name']} <{'(custom)' if self.config.get('git_committer_email') else 'noreply'}>",
                 who=self._who_can_use(),
                 allow=", ".join(self._allowed_repos()) or "(空=只写自己的 login)",
             )

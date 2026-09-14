@@ -11,6 +11,11 @@ from typing import Any
 
 import httpx
 
+try:
+    from .redact import find_secret
+except ImportError:
+    from redact import find_secret
+
 API_VERSION = "2022-11-28"
 DEFAULT_API_BASE = "https://api.github.com"
 USER_AGENT = "astrbot-plugin-github-ops"
@@ -88,11 +93,17 @@ class GitHubClient:
         token: str,
         api_base: str = DEFAULT_API_BASE,
         proxy: str = "",
+        committer_name: str = "",
+        committer_email: str = "",
     ) -> None:
         self._token = (token or "").strip()
         self._api_base = (api_base or DEFAULT_API_BASE).rstrip("/")
         self._proxy = (proxy or "").strip()
+        self._committer_name = (committer_name or "").strip()
+        self._committer_email = (committer_email or "").strip()
         self._login: str | None = None
+        self._id: int | None = None
+        self._profile_email: str = ""
         client_kwargs: dict[str, Any] = {
             "base_url": self._api_base,
             "timeout": httpx.Timeout(30.0, connect=10.0),
@@ -175,6 +186,12 @@ class GitHubClient:
     async def whoami(self) -> dict[str, Any]:
         me = await self.get("/user")
         self._login = me.get("login")
+        self._id = me.get("id")
+        raw_email = (me.get("email") or "").strip()
+        if raw_email and "users.noreply.github.com" not in raw_email:
+            self._profile_email = raw_email
+        else:
+            self._profile_email = ""
         rate = await self.get("/rate_limit")
         core = (rate.get("resources") or {}).get("core") or {}
         return {
@@ -190,6 +207,22 @@ class GitHubClient:
                 "reset": core.get("reset"),
             },
         }
+
+
+    async def _ensure_identity(self) -> None:
+        if not self._login or self._id is None:
+            await self.whoami()
+
+    def get_commit_author(self) -> dict[str, str]:
+        login = (self._login or "").strip() or "unknown"
+        name = self._committer_name or login
+        if self._committer_email:
+            email = self._committer_email
+        elif self._id:
+            email = f"{self._id}+{login}@users.noreply.github.com"
+        else:
+            email = f"{login}@users.noreply.github.com"
+        return {"name": name, "email": email}
 
     async def login(self) -> str:
         if self._login:
@@ -239,7 +272,7 @@ class GitHubClient:
         *,
         description: str = "",
         private: bool = True,
-        auto_init: bool = True,
+        auto_init: bool = False,
     ) -> dict[str, Any]:
         name = (name or "").strip()
         if not name:
@@ -362,9 +395,20 @@ class GitHubClient:
         except GitHubError as exc:
             if exc.status != 404:
                 raise
+        needles = [self._profile_email] if self._profile_email else None
+        secret_err = find_secret(content, token=self._token, extra_needles=needles)
+        if secret_err:
+            raise GitHubError(400, f"拒绝写入文件 {path}: {secret_err}")
+        secret_err_msg = find_secret(message, token=self._token, extra_needles=needles)
+        if secret_err_msg:
+            raise GitHubError(400, f"拒绝提交信息: {secret_err_msg}")
+        await self._ensure_identity()
+        author = self.get_commit_author()
         body: dict[str, Any] = {
             "message": message or f"update {path}",
             "content": base64.b64encode((content or "").encode("utf-8")).decode("ascii"),
+            "author": author,
+            "committer": author,
         }
         if branch:
             body["branch"] = branch
@@ -398,6 +442,15 @@ class GitHubClient:
             cleaned.append({"path": path, "content": str(item.get("content") or "")})
         if not cleaned:
             raise GitHubError(400, "files 里没有有效 path")
+
+        needles = [self._profile_email] if self._profile_email else None
+        for item in cleaned:
+            secret_err = find_secret(item["content"], token=self._token, extra_needles=needles)
+            if secret_err:
+                raise GitHubError(400, f"拒绝写入文件 {item['path']}: {secret_err}")
+        secret_err_msg = find_secret(message, token=self._token, extra_needles=needles)
+        if secret_err_msg:
+            raise GitHubError(400, f"拒绝提交信息: {secret_err_msg}")
 
         repo_info = await self.get(f"/repos/{owner}/{repo}")
         branch = branch or repo_info.get("default_branch") or "main"
@@ -455,12 +508,16 @@ class GitHubClient:
             f"/repos/{owner}/{repo}/git/trees",
             {"base_tree": base_tree, "tree": tree_items},
         )
+        await self._ensure_identity()
+        author = self.get_commit_author()
         new_commit = await self.post(
             f"/repos/{owner}/{repo}/git/commits",
             {
                 "message": message or "update files",
                 "tree": tree.get("sha"),
                 "parents": [base_sha],
+                "author": author,
+                "committer": author,
             },
         )
         await self.patch(

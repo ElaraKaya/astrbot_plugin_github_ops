@@ -27,7 +27,8 @@ github_ops(task="完整任务", local_dir="/abs/path")
 2. 严禁输出 token / PAT / Authorization。
 3. 不要在无关仓库乱开 issue / 提 PR，除非用户明确指定。
 4. 不要提交 `.env`、私钥、`credentials` 等敏感信息。
-5. `delete` 默认是关的。未开启配置不要尝试删仓。
+5. `github_repo action=delete` 会删整个仓库，默认关。未开启配置不要尝试删仓。删仓库里的文件用 `github_files` 的 delete / sync，与这项无关。删分支用 `github_misc action=delete_branch`，不能删默认分支。
 6. fork 的 owner 是源仓，目标写入当前登录账号；刚 fork 完可能要等几秒就绪。
 7. 用户需要落点时可新建 private 仓并提交，然后只回 `html_url`。不要无意义地建空仓。
-8. 有 `local_dir` 就让子循环用 `github_files` 的 `local_paths` 推，不要再抄正文。
+8. 有 `local_dir` 就让子循环用 `github_files action=sync` 或 `local_paths` 推，不要再抄正文。
+9. 子循环若报未知 action / 缺参数 / 结果不符：把错误原样告诉用户，不要自己换 action 名试探。

@@ -1,72 +1,123 @@
 # astrbot_plugin_github_ops
 
-让 AstrBot 利用 GitHub API Key 进行仓库管理、代码提交与协作操作。
+让 AstrBot 用配置好的 GitHub 账号做仓库管理、提交代码、Issue / PR 协作。
+
+- 插件名：`astrbot_plugin_github_ops`
+- 作者：Elara
+- 版本：0.5.1
+- 需要 AstrBot `>=4.5.7`
 
 主对话只注册一个函数工具 `github_ops(task, local_dir?)`。真正的建仓 / 提交 / issue / fork / PR 在子循环里用内层工具完成，**不会**把几十个工具和海量 schema 灌进每轮主对话上下文。
 
 推本地源码时传 `local_dir`（绝对路径）。子循环只能读这个目录，插件原生读取文件并推送 GitHub，无需模型抄录文件正文。
 
-## 工作原理
+## 介绍
 
-1. **单入口门面架构**
-   主对话上下文仅暴露一个统一工具 `github_ops`，接收自包含任务描述 `task`（以及可选本地路径 `local_dir`）。模型无需在主上下文加载数十个繁杂的细粒度 action。
+1. **单入口门面**：主对话只暴露 `github_ops`，把完整任务写进 `task`。
+2. **子循环隔离**：插件启动独立 `tool_loop_agent`，主聊天记录不会进子代理。
+3. **本地目录沙盒**：`local_dir` 越界会拒；list / 推送默认尊重 `.gitignore`。
+4. **文件级提交**：支持更新、删除单个文件，以及把本地目录 `sync` 到仓库（可删远端多余文件）。
+5. **安全护栏**：写入白名单、敏感路径拦截、正文凭据扫描、输出脱敏。提交默认使用 GitHub noreply 邮箱。
 
-2. **Tool-Loop 子代理隔离**
-   调用 `github_ops` 后，插件启动独立的 `tool_loop_agent` 执行子循环。子循环中传入独立的微工具集（ToolSet）以及隔离上下文（`contexts=[]`），主聊天记录不会泄露至子代理，避免上下文污染和安全外溢。
+相关链接：仓库 <https://github.com/ElaraKaya/astrbot_plugin_github_ops>
 
-3. **内置内层工具集**
-   子循环内仅挂载精简的专项工具：
-   - `github_whoami`：查询并校验当前认证账号与速率限额
-   - `github_repo`：仓库管理（list / get / create / delete）
-   - `github_files`：文件读写与提交（list / get / put / push），支持引用本地目录批量推送
-   - `github_local`：安全沙盒读取本地授权目录结构与文件
-   - `github_issue`：Issue 生命周期管理（list / get / create / comment / update）
-   - `github_pr`：Pull Request 查看、创建与合并（list / create / merge）
-   - `github_misc`：辅助协作操作（fork / star / branch）
+## Token 说明（必读）
 
-4. **安全护栏机制**
-   - **身份防泄露**：提交默认强制使用 GitHub 官方隐私邮箱格式 `{id}+{login}@users.noreply.github.com`，避免在 public commit 中暴露个人主邮箱；新建仓库 `auto_init=False`，首条 commit 由插件通过 Contents API 注入受控身份。
-   - **权限审查**：配置 `who_can_use`（默认仅 admin 可触发），无权会话立即拦截；
-   - **写入白名单**：`allowed_repos` 严格限制写操作目标，默认仅允许写入当前凭证所属账号；
-   - **敏感路径拦截**：自动拦截 `.env`、`id_rsa`、`credentials`、`*.pem` 等敏感密钥路径提交与读取；
-   - **正文凭据扫描**：提交前深度扫描文件内容、commit message、PR / Issue 标题与正文中的 PAT、API Key、私钥以及当前账号绑定的私人邮箱，命中则拒绝写入；
-   - **输出硬脱敏**：子循环内层工具返回、最终回复及异常日志统一经过 `redact_text` 过滤脱敏，防止 Token 或代理凭据回显。
-   - **已知限制**：`merge_pr` 产生的 merge/squash commit 身份由 GitHub Merge API 决定。
+填写的是 **GitHub Personal Access Token**（PAT），只写在本插件设置里，不要发到聊天。
+
+PAT 建议权限：
+
+- fine-grained：Contents、Issues、Pull requests、Administration、Metadata；Repository access 选 **All repositories**（或至少包含要写的仓库）
+- classic：`repo`
+
+`allow_delete_repo` 默认关，只控制**删整个仓库**。删仓库里的某个文件（例如 `MODEL.md`）不需要打开这项。
 
 ## 安装
 
-1. 把本目录放到 `AstrBot/data/plugins/astrbot_plugin_github_ops/`
-2. 安装依赖：`httpx`
-3. WebUI 重载插件
-4. 插件配置里填写 `github_token`
+### 方式一：插件市场（推荐）
 
-PAT 建议权限：
-- fine-grained：Contents、Issues、Pull requests、Administration、Metadata；Repository access 选 **All repositories**
-- classic：`repo`
+在 AstrBot 管理面板打开 **插件市场**，搜索 `astrbot_plugin_github_ops` 或「GitHub Ops」，点击安装即可。
+
+### 方式二：用仓库地址安装
+
+在 AstrBot 管理面板的插件管理里，通过 GitHub 仓库地址安装：
+
+```text
+https://github.com/ElaraKaya/astrbot_plugin_github_ops
+```
+
+或在聊天里（需管理员）执行：
+
+```text
+plugin i https://github.com/ElaraKaya/astrbot_plugin_github_ops
+```
+
+安装后在插件列表里启用 / 重载，再打开本插件配置填写 PAT。
 
 ## 配置
 
-| 配置项 | 默认值 | 说明 |
-| --- | --- | --- |
-| github_token | 空 | GitHub 个人访问令牌 (PAT) |
-| api_base | `https://api.github.com` | GitHub API 基础 URL，GHE 场景可按需修改 |
-| http_proxy | 空 | 出口代理地址。留空走系统环境变量 `HTTP(S)_PROXY` |
-| git_committer_name | 空 | Git 提交者显示名称。留空使用账号 login |
-| git_committer_email | 空 | Git 提交者邮箱。留空自动使用 `{id}+{login}@users.noreply.github.com` 保护隐私 |
-| who_can_use | admin | 权限控制：`admin` 仅管理员；`all` 所有人可用 |
-| default_private | true | 新建仓库默认设置为私有 |
-| allow_delete_repo | false | 是否允许执行删仓操作 |
-| allow_merge_pr | true | 是否允许合并 PR |
-| allowed_repos | `[]` | 允许写入的仓库白名单。为空时仅允许写入当前登录账号名下的仓库 |
+最少只要填 Token：
+
+| 配置 | 说明 |
+| --- | --- |
+| `github_token` | **必填。** GitHub PAT |
+| `api_base` | 默认 `https://api.github.com`。GitHub Enterprise 才改 |
+| `http_proxy` | 出口代理。留空走系统 `HTTP(S)_PROXY` |
+| `git_committer_name` | 提交者显示名。留空用账号 login |
+| `git_committer_email` | 提交者邮箱。留空自动用 `{id}+{login}@users.noreply.github.com` |
+| `who_can_use` | `admin` 仅管理员；`all` 所有人可用 |
+| `default_private` | 新建仓库默认私有 |
+| `allow_delete_repo` | 是否允许**删整个仓库**。默认关。不影响删文件 |
+| `allow_merge_pr` | 是否允许合并 PR |
+| `max_steps` | 子循环最大工具步数，默认 24（范围 4–60） |
+| `allowed_repos` | 可写仓库白名单。空=只能写当前登录账号名下的仓 |
 
 ## 使用
 
-管理员发 `/github` 检查 API Key 与账号状态。
+管理员发 `/github` 检查 API Key 与账号状态。`/github actions` 查看内层 action 说明。
 
-自然语言调用示例：「建一个 private 仓 `toy-notes`，README 写一句话，把链接给我」。
+自然语言示例：「建一个 private 仓 `toy-notes`，README 写一句话，把链接给我」。
 
 模型应调用 `github_ops(task=完整任务)`。需要推本地目录时再加 `local_dir=/abs/path`。`task` 必须自包含；有 `local_dir` 时无需塞入文件正文。
 
+同步本地插件目录、并删掉仓库里多出来的文件时，直接把这件事写进 `task` 即可。子循环会用 `github_files action=sync`（或 `delete` / `push` + `files[].delete=true`），不要把文件写成空内容来“假装删除”。
+
+子循环遇到未知 action、缺参数或结果不符时会直接汇报，而不是换名字乱猜或另开测试分支。
+
+### 给大模型用的工具
+
+主对话只挂 `github_ops`。子循环内层工具：
+
+- `github_whoami`：当前账号与速率限额（身份会预注入，一般不必再调）
+- `github_repo`：list / get / create / delete / commits（delete = 删仓）
+- `github_files`：list / get / put / push / delete / sync（delete = 删文件）
+- `github_local`：读已授权本地目录
+- `github_issue` / `github_pr` / `github_misc`：协作与 fork / star / 建分支 / 删分支（不能删默认分支）
+
 ## 许可证
 
-MIT
+本项目基于 [MIT License](LICENSE) 开源。
+
+```text
+MIT License
+
+Copyright (c) 2026 Elara
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```

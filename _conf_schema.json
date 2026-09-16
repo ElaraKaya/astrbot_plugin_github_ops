@@ -36,15 +36,21 @@
     "default": true
   },
   "allow_delete_repo": {
-    "description": "允许 delete_repo",
+    "description": "允许 delete_repo（删整个仓库）",
     "type": "bool",
-    "hint": "默认关。打开后模型可以删这个号下的仓库。",
+    "hint": "默认关。只控制删整个仓库，不影响删仓库里的单个文件。打开后模型可以删这个号下的仓库。",
     "default": false
   },
   "allow_merge_pr": {
     "description": "允许 merge_pr",
     "type": "bool",
     "default": true
+  },
+  "max_steps": {
+    "description": "子循环最大工具步数",
+    "type": "int",
+    "hint": "默认 24（范围 4–60）。同步目录大约 4–8 步；过小会在中途被强制结束。",
+    "default": 24
   },
   "allowed_repos": {
     "description": "可写仓库白名单",

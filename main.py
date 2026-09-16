@@ -34,6 +34,7 @@ from .ops import (
     help_text,
     map_group_action,
     repo_write_allowed,
+    unknown_group_action,
 )
 
 try:
@@ -48,15 +49,34 @@ _local_root_var: ContextVar[Path | None] = ContextVar("github_ops_local_root", d
 
 INNER_SYSTEM_PROMPT = (
     "执行 GitHub 相关任务。用工具干活。"
-    "先 github_whoami 确认身份再写。"
+    "身份已在任务里给出，不必先调 github_whoami。"
     "只回摘要和 html_url。"
     "严禁输出 token / PAT / Authorization。"
     "工具若返回 [REDACTED] 不要试图还原。"
     "没要求就别把文件正文或 issue 全文丢回来。"
     "task 已自包含，不要假设还有聊天记录。"
     "fork 的 owner 是源仓；写入目标默认是当前登录账号。"
-    "若已授予 local_dir：github_local 只能读这个目录；"
-    "推仓用 github_files 的 local_paths，不要把文件正文再抄一遍。"
+    "若已授予 local_dir：github_local 只能读这个目录（list 已按 .gitignore 过滤）；"
+    "推仓用 github_files 的 sync 或 local_paths，不要把文件正文再抄一遍。"
+    "删文件用 github_files action=delete，或 push/sync 时 files[].delete=true。"
+    "这与删仓无关；github_repo action=delete 才会删整个仓库，且通常禁止。"
+    "删分支用 github_misc action=delete_branch，禁止删默认分支。"
+    "不要为了试 API 另开分支；用户没要求就写默认分支。"
+    "遇到工具报错、未知 action、缺参数、结果与任务不符："
+    "立刻停止试探，在最终回复里如实汇报原因。禁止改 action 名乱猜，"
+    "禁止建实验分支，禁止把文件写成空内容来模拟删除。"
+)
+
+INNER_INCIDENT_PROMPT = (
+    "[运行规则]\n"
+    "身份已确认，不必调 github_whoami。\n"
+    "意外情况（工具报错、未知 action、缺参数、结果和任务不符）立刻停止试探，"
+    "在最终回复如实汇报，不要换 action 名乱猜，不要另开测试分支，"
+    "不要把文件写成空内容来模拟删除。\n"
+    "删文件：github_files action=delete，或 push/sync 的 files.delete=true。"
+    "这与配置里的 allow_delete_repo（删整个仓库）无关。\n"
+    "删分支：github_misc action=delete_branch，不能删默认分支。\n"
+    "有 local_dir 时优先 github_files action=sync（整目录）或 local_paths。"
 )
 
 TOOL_DESCRIPTION = (
@@ -191,6 +211,14 @@ class GitHubOpsPlugin(Star):
         value = str(self.config.get("who_can_use") or "admin").strip().lower()
         return value if value in {"admin", "all"} else "admin"
 
+    def _max_steps(self) -> int:
+        raw = self.config.get("max_steps", 24)
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            n = 24
+        return min(max(n, 4), 60)
+
     def _allowed_repos(self) -> list[str]:
         raw = self.config.get("allowed_repos") or []
         if isinstance(raw, str):
@@ -222,11 +250,7 @@ class GitHubOpsPlugin(Star):
         else:
             mapped = map_group_action(group, str(kwargs.get("action") or ""))
             if not mapped:
-                return dumps(
-                    {
-                        "error": f"未知 {group} action: {kwargs.get('action')}",
-                    }
-                )
+                return unknown_group_action(group, str(kwargs.get("action") or ""))
             action = mapped
         if action in PATH_CHECKED_ACTIONS:
             blocked = blocked_paths_in(kwargs)
@@ -288,13 +312,27 @@ class GitHubOpsPlugin(Star):
         except GitHubError as exc:
             return dumps({"error": exc.message, "status": exc.status})
 
-        prompt = task
+        try:
+            me = await client.whoami()
+        except GitHubError as exc:
+            return dumps({"error": exc.message, "status": exc.status})
+        except Exception as exc:
+            return dumps({"error": "github whoami 失败", "detail": type(exc).__name__})
+
+        login = me.get("login") or ""
+        rate = me.get("rate_limit") or {}
+        identity_block = (
+            f"[bot GitHub login={login} html_url={me.get('html_url')} "
+            f"rate={rate.get('remaining')}/{rate.get('limit')}]"
+        )
+        prompt_parts = [task.strip(), "", identity_block, INNER_INCIDENT_PROMPT]
         if local_root is not None:
-            prompt = (
-                f"{task}\n\n"
+            prompt_parts.append(
                 f"[granted local_dir={local_root}]\n"
-                "只读这个目录。推仓用 github_files local_paths，不要抄文件正文。"
+                "只读这个目录。推仓用 github_files action=sync 或 local_paths，不要抄文件正文。"
+                "list 已按 .gitignore 过滤。"
             )
+        prompt = "\n".join(prompt_parts)
 
         token = _local_root_var.set(local_root)
         try:
@@ -306,8 +344,8 @@ class GitHubOpsPlugin(Star):
                 "prompt": prompt,
                 "system_prompt": INNER_SYSTEM_PROMPT,
                 "tools": _make_tool_set(build_inner_tools()),
-                "max_steps": 12,
-                "tool_call_timeout": 60,
+                "max_steps": self._max_steps(),
+                "tool_call_timeout": 120,
             }
             try:
                 params = inspect.signature(self.context.tool_loop_agent).parameters
@@ -373,6 +411,7 @@ class GitHubOpsPlugin(Star):
             "proxy: {proxy}\n"
             "committer: {committer}\n"
             "who_can_use: {who}\n"
+            "max_steps: {steps}\n"
             "allowed_repos: {allow}".format(
                 login=me.get("login"),
                 url=me.get("html_url"),
@@ -383,6 +422,7 @@ class GitHubOpsPlugin(Star):
                 proxy=client.proxy_display() or "(空=环境变量 HTTP(S)_PROXY)",
                 committer=f"{client.get_commit_author()['name']} <{'(custom)' if self.config.get('git_committer_email') else 'noreply'}>",
                 who=self._who_can_use(),
+                steps=self._max_steps(),
                 allow=", ".join(self._allowed_repos()) or "(空=只写自己的 login)",
             )
         )

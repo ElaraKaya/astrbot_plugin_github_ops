@@ -5,6 +5,8 @@ Inner tools may only touch files under the granted local_dir.
 
 from __future__ import annotations
 
+import base64
+import re
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +36,14 @@ SKIP_SUFFIXES = (
     ".dll",
     ".bin",
     ".exe",
+    ".zip",
+    ".gz",
+    ".tar",
+    ".whl",
+    ".7z",
+    ".rar",
+)
+BINARY_SUFFIXES = (
     ".png",
     ".jpg",
     ".jpeg",
@@ -41,13 +51,11 @@ SKIP_SUFFIXES = (
     ".webp",
     ".ico",
     ".pdf",
-    ".zip",
-    ".gz",
-    ".tar",
-    ".whl",
     ".woff",
     ".woff2",
     ".ttf",
+    ".otf",
+    ".eot",
 )
 MAX_FILE_BYTES = 512 * 1024
 MAX_PUSH_FILES = 80
@@ -90,6 +98,11 @@ def is_blocked_path(path: str) -> bool:
     return any(name.endswith(suf) for suf in _BLOCKED_SUFFIXES)
 
 
+def is_binary_path(path: str) -> bool:
+    lower = (path or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return any(lower.endswith(suf) for suf in BINARY_SUFFIXES)
+
+
 def normalize_rel(path: str) -> str:
     text = (path or "").replace("\\", "/").strip()
     if not text or text == ".":
@@ -128,38 +141,183 @@ def rel_posix(root: Path, path: Path) -> str:
     return path.resolve().relative_to(root.resolve()).as_posix()
 
 
-def should_skip(path: Path, root: Path) -> bool:
+class GitIgnore:
+    """Root-level .gitignore matcher (negation, *, **, character class)."""
+
+    def __init__(self, rules: list[tuple[bool, Any]]):
+        self._rules = rules
+
+    @classmethod
+    def from_root(cls, root: Path) -> GitIgnore:
+        path = root / ".gitignore"
+        rules: list[tuple[bool, Any]] = []
+        if not path.is_file():
+            return cls(rules)
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return cls(rules)
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            negated = line.startswith("!")
+            if negated:
+                line = line[1:]
+            compiled = _compile_gitignore_line(line)
+            if compiled is not None:
+                rules.append((negated, compiled))
+        return cls(rules)
+
+    def ignored(self, rel: str) -> bool:
+        rel_n = normalize_rel(rel)
+        if not rel_n:
+            return False
+        ignored = False
+        for negated, matcher in self._rules:
+            if matcher(rel_n):
+                ignored = not negated
+        return ignored
+
+
+def _compile_gitignore_line(pattern: str):
+    pattern = pattern.strip()
+    if not pattern:
+        return None
+    dir_only = pattern.endswith("/")
+    if dir_only:
+        pattern = pattern[:-1]
+    anchored = "/" in pattern[:-1] if pattern else False
+    if pattern.startswith("/"):
+        anchored = True
+        pattern = pattern[1:]
+    regex = _gitignore_glob_to_regex(pattern)
+    if anchored:
+        body = rf"^{regex}"
+    else:
+        body = rf"(?:^|/){regex}"
+    if dir_only:
+        full = body + r"(?:/|$)"
+    else:
+        full = body + r"(?:$|/)"
+    try:
+        cre = re.compile(full)
+    except re.error:
+        return None
+
+    def matcher(rel: str, _cre=cre) -> bool:
+        return _cre.search(rel) is not None
+
+    return matcher
+
+
+def _gitignore_glob_to_regex(pattern: str) -> str:
+    out: list[str] = []
+    i = 0
+    n = len(pattern)
+    while i < n:
+        ch = pattern[i]
+        if ch == "*" and i + 1 < n and pattern[i + 1] == "*":
+            if i + 2 < n and pattern[i + 2] == "/":
+                out.append("(?:.*/)?")
+                i += 3
+                continue
+            out.append(".*")
+            i += 2
+            continue
+        if ch == "*":
+            out.append("[^/]*")
+            i += 1
+            continue
+        if ch == "?":
+            out.append("[^/]")
+            i += 1
+            continue
+        if ch == "[":
+            j = i + 1
+            if j < n and pattern[j] in {"!", "^"}:
+                j += 1
+            if j < n and pattern[j] == "]":
+                j += 1
+            while j < n and pattern[j] != "]":
+                j += 1
+            if j >= n:
+                out.append(re.escape(ch))
+                i += 1
+                continue
+            klass = pattern[i : j + 1]
+            if klass.startswith("[!") or klass.startswith("[^"):
+                inner = klass[2:-1]
+                out.append("[^" + inner.replace("\\", "\\\\") + "]")
+            else:
+                out.append(klass)
+            i = j + 1
+            continue
+        out.append(re.escape(ch))
+        i += 1
+    return "".join(out)
+
+
+def skip_reason(path: Path, root: Path, gitignore: GitIgnore | None = None) -> str | None:
     try:
         rel = path.resolve().relative_to(root.resolve())
     except ValueError:
-        return True
+        return "escape"
+    rel_s = rel.as_posix()
     if any(part in SKIP_DIRS for part in rel.parts):
-        return True
+        return "skip-dir"
     name = path.name.lower()
     if name in SKIP_FILE_NAMES:
-        return True
+        return "skip-name"
     if name.endswith(SKIP_SUFFIXES):
-        return True
-    if is_blocked_path(rel.as_posix()):
-        return True
-    return False
+        return "skip-suffix"
+    if is_blocked_path(rel_s):
+        return "blocked"
+    if gitignore is not None and gitignore.ignored(rel_s):
+        return "gitignore"
+    return None
+
+
+def should_skip(path: Path, root: Path, gitignore: GitIgnore | None = None) -> bool:
+    return skip_reason(path, root, gitignore) is not None
+
+
+def load_gitignore(root: Path) -> GitIgnore:
+    return GitIgnore.from_root(root)
 
 
 def list_local_entries(root: Path, rel: str = "") -> dict[str, Any]:
     target = resolve_under_root(root, rel)
+    gitignore = load_gitignore(root)
     if target.is_file():
+        reason = skip_reason(target, root, gitignore)
+        if reason:
+            raise GitHubError(403, _skip_error(reason, rel_posix(root, target)))
         return {
             "type": "file",
             "path": rel_posix(root, target),
             "size": target.stat().st_size,
+            "binary": is_binary_path(target.name),
         }
     if not target.is_dir():
         raise GitHubError(404, f"本地不存在: {rel or '.'}")
     entries: list[dict[str, Any]] = []
+    ignored = 0
     for p in sorted(target.rglob("*")):
-        if not p.is_file() or should_skip(p, root):
+        if not p.is_file():
             continue
-        entries.append({"path": rel_posix(root, p), "size": p.stat().st_size})
+        reason = skip_reason(p, root, gitignore)
+        if reason:
+            if reason == "gitignore":
+                ignored += 1
+            continue
+        entries.append(
+            {
+                "path": rel_posix(root, p),
+                "size": p.stat().st_size,
+                "binary": is_binary_path(p.name),
+            }
+        )
         if len(entries) >= MAX_LIST:
             break
     return {
@@ -168,6 +326,8 @@ def list_local_entries(root: Path, rel: str = "") -> dict[str, Any]:
         "path": rel_posix(root, target) if target != root else ".",
         "count": len(entries),
         "truncated": len(entries) >= MAX_LIST,
+        "gitignore": True,
+        "ignored_filtered": ignored,
         "entries": entries,
     }
 
@@ -178,11 +338,15 @@ def read_local_file(root: Path, rel: str, limit: int = 2000) -> dict[str, Any]:
         raise GitHubError(400, "那是目录，用 list")
     if not target.is_file():
         raise GitHubError(404, f"本地不存在: {rel}")
-    if should_skip(target, root) or is_blocked_path(rel_posix(root, target)):
-        raise GitHubError(403, "拒绝敏感路径")
+    gitignore = load_gitignore(root)
+    reason = skip_reason(target, root, gitignore)
+    if reason:
+        raise GitHubError(403, _skip_error(reason, rel_posix(root, target)))
     size = target.stat().st_size
     if size > MAX_FILE_BYTES:
         raise GitHubError(400, f"文件过大: {rel} ({size} bytes)")
+    if is_binary_path(target.name):
+        raise GitHubError(400, f"二进制文件不读正文: {rel}。推仓用 github_files local_paths / sync")
     try:
         text = target.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:
@@ -195,31 +359,72 @@ def read_local_file(root: Path, rel: str, limit: int = 2000) -> dict[str, Any]:
     }
 
 
-def _read_text_file(root: Path, path: Path) -> dict[str, str]:
+def _skip_error(reason: str, rel: str) -> str:
+    if reason == "gitignore":
+        return f"被 .gitignore 忽略: {rel}"
+    if reason == "blocked":
+        return f"拒绝敏感路径: {rel}"
+    return f"跳过: {rel} ({reason})"
+
+
+def _read_file_for_push(root: Path, path: Path) -> dict[str, Any]:
     size = path.stat().st_size
+    rel = rel_posix(root, path)
     if size > MAX_FILE_BYTES:
-        raise GitHubError(400, f"文件过大: {rel_posix(root, path)} ({size} bytes)")
+        raise GitHubError(400, f"文件过大: {rel} ({size} bytes)")
+    raw = path.read_bytes()
+    if is_binary_path(path.name):
+        return {
+            "path": rel,
+            "content": base64.b64encode(raw).decode("ascii"),
+            "encoding": "base64",
+        }
     try:
-        content = path.read_text(encoding="utf-8")
-    except UnicodeDecodeError as exc:
-        raise GitHubError(400, f"二进制文件不推: {rel_posix(root, path)}") from exc
-    return {"path": rel_posix(root, path), "content": content}
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return {
+            "path": rel,
+            "content": base64.b64encode(raw).decode("ascii"),
+            "encoding": "base64",
+        }
+    return {"path": rel, "content": text, "encoding": "utf-8"}
 
 
-def collect_local_files(root: Path, paths: list[str]) -> list[dict[str, str]]:
+def collect_local_bundle(
+    root: Path, paths: list[str]
+) -> tuple[list[dict[str, Any]], list[dict[str, str]], set[str]]:
+    """Return (files_to_push, skipped, present_paths)."""
     if not paths:
         paths = [""]
-    files: list[dict[str, str]] = []
+    gitignore = load_gitignore(root)
+    files: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    present: set[str] = set()
     seen: set[str] = set()
+
+    def add_skipped(rel: str, reason: str) -> None:
+        skipped.append({"path": rel, "reason": reason})
+
     for raw in paths:
         target = resolve_under_root(root, raw)
         if target.is_dir():
             for p in sorted(target.rglob("*")):
-                if not p.is_file() or should_skip(p, root):
+                if not p.is_file():
                     continue
+                rel = rel_posix(root, p)
+                reason = skip_reason(p, root, gitignore)
+                if reason:
+                    if reason not in {"skip-dir", "skip-name", "skip-suffix", "gitignore", "blocked"}:
+                        add_skipped(rel, reason)
+                    elif reason in {"skip-suffix"}:
+                        present.add(rel)
+                        add_skipped(rel, reason)
+                    continue
+                present.add(rel)
                 try:
-                    item = _read_text_file(root, p)
-                except GitHubError:
+                    item = _read_file_for_push(root, p)
+                except GitHubError as exc:
+                    add_skipped(rel, exc.message)
                     continue
                 if item["path"] in seen:
                     continue
@@ -230,14 +435,24 @@ def collect_local_files(root: Path, paths: list[str]) -> list[dict[str, str]]:
             continue
         if not target.is_file():
             raise GitHubError(404, f"本地不存在: {raw}")
-        if should_skip(target, root) or is_blocked_path(rel_posix(root, target)):
-            raise GitHubError(403, "拒绝敏感路径")
-        item = _read_text_file(root, target)
+        rel = rel_posix(root, target)
+        reason = skip_reason(target, root, gitignore)
+        if reason:
+            if reason == "blocked":
+                raise GitHubError(403, _skip_error(reason, rel))
+            raise GitHubError(403, _skip_error(reason, rel))
+        present.add(rel)
+        item = _read_file_for_push(root, target)
         if item["path"] not in seen:
             seen.add(item["path"])
             files.append(item)
         if len(files) > MAX_PUSH_FILES:
             raise GitHubError(400, f"一次最多推 {MAX_PUSH_FILES} 个文件")
+    return files, skipped, present
+
+
+def collect_local_files(root: Path, paths: list[str]) -> list[dict[str, Any]]:
+    files, _skipped, _present = collect_local_bundle(root, paths)
     if not files:
         raise GitHubError(400, "local_dir 下没有可推的文件")
     return files

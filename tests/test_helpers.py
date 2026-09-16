@@ -1,7 +1,9 @@
 import asyncio
 import importlib.util
 import json
+import shutil
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -138,15 +140,115 @@ def test_redact_module() -> None:
     assert "and ok" in cleaned
 
 
+def test_delete_branch_client_guard() -> None:
+    client = gc.GitHubClient("tok")
+
+    async def fake_resolve(owner, repo):
+        return "bot", "toy"
+
+    async def fake_get(path, **params):
+        return {"default_branch": "main"}
+
+    async def boom_delete(path, body=None):
+        raise AssertionError(f"should not delete {path}")
+
+    client.resolve_repo = fake_resolve  # type: ignore[method-assign]
+    client.get = fake_get  # type: ignore[method-assign]
+    client.delete = boom_delete  # type: ignore[method-assign]
+
+    try:
+        asyncio.run(client.delete_branch("bot", "toy", "main"))
+        raise AssertionError("default branch should be blocked")
+    except gc.GitHubError as exc:
+        assert exc.status == 403
+        assert "默认分支" in exc.message
+
+    try:
+        asyncio.run(client.delete_branch("bot", "toy", "refs/heads/main"))
+        raise AssertionError("refs/heads/main should be blocked")
+    except gc.GitHubError as exc:
+        assert exc.status == 403
+
+    called = {"path": ""}
+
+    async def ok_delete(path, body=None):
+        called["path"] = path
+        return None
+
+    client.delete = ok_delete  # type: ignore[method-assign]
+    result = asyncio.run(client.delete_branch("bot", "toy", "test-check"))
+    assert result["deleted"] is True
+    assert result["branch"] == "test-check"
+    assert result["default_branch"] == "main"
+    assert called["path"].endswith("/git/refs/heads/test-check")
+
+    async def missing_delete(path, body=None):
+        raise gc.GitHubError(404, "Not Found")
+
+    client.delete = missing_delete  # type: ignore[method-assign]
+    absent = asyncio.run(client.delete_branch("bot", "toy", "gone"))
+    assert absent["deleted"] is False
+    assert absent["already_absent"] is True
+
+
+def test_branch_name_guards() -> None:
+    assert gc.normalize_branch_name("test-check") == "test-check"
+    assert gc.normalize_branch_name("refs/heads/test-check") == "test-check"
+    assert gc.normalize_branch_name("heads/feature/foo") == "feature/foo"
+    assert gc.normalize_branch_name("  refs/heads/main  ") == "main"
+    assert gc.is_default_branch("main", "main")
+    assert gc.is_default_branch("refs/heads/main", "main")
+    assert gc.is_default_branch("heads/master", "master")
+    assert not gc.is_default_branch("test-check", "main")
+    assert not gc.is_default_branch("main", "master")
+    assert not gc.is_default_branch("", "main")
+
+
+def test_git_blob_sha() -> None:
+    data = b"hello\n"
+    expect = __import__("hashlib").sha1(b"blob 6\0" + data).hexdigest()
+    assert gc.git_blob_sha(data) == expect
+    item = {"path": "a.txt", "content": "hello\n", "encoding": "utf-8"}
+    assert gc.file_blob_sha(item) == expect
+
+
 def test_ops_guards() -> None:
     ops = _load_ops()
     files = ops._as_files('[{"path":"README.md","content":"# hi"}]')
-    assert files == [{"path": "README.md", "content": "# hi"}]
+    assert files == [
+        {"path": "README.md", "content": "# hi", "encoding": "utf-8", "delete": False}
+    ]
+    deleted = ops._as_files([{"path": "MODEL.md", "delete": True}])
+    assert deleted == [{"path": "MODEL.md", "delete": True}]
+    try:
+        ops._as_files([{"path": "MODEL.md"}])
+        raise AssertionError("missing content should fail")
+    except gc.GitHubError as exc:
+        assert "delete=true" in exc.message
+    try:
+        ops._as_files([{"path": "MODEL.md", "content": None}])
+        raise AssertionError("null content should fail")
+    except gc.GitHubError as exc:
+        assert "delete=true" in exc.message
+    empty = ops._as_files([{"path": "empty.txt", "content": ""}])
+    assert empty[0]["content"] == ""
     assert ops.map_group_action("github_repo", "create") == "create_repo"
     assert ops.map_group_action("github_files", "push") == "push_files"
+    assert ops.map_group_action("github_files", "delete") == "delete_file"
+    assert ops.map_group_action("github_files", "del") == "delete_file"
+    assert ops.map_group_action("github_files", "sync") == "sync_files"
     assert ops.map_group_action("github_local", "list") == "list_local"
     assert ops.map_group_action("github_misc", "fork") == "fork_repo"
+    assert ops.map_group_action("github_misc", "branch") == "create_branch"
+    assert ops.map_group_action("github_misc", "delete_branch") == "delete_branch"
+    assert ops.map_group_action("github_misc", "del_branch") == "delete_branch"
     assert ops.map_group_action("github_repo", "nope") is None
+    misc_unknown = json.loads(ops.unknown_group_action("github_misc", "nuke"))
+    assert misc_unknown["allowed"] == ["fork", "star", "branch", "delete_branch"]
+    assert "默认分支" in misc_unknown["hint"]
+    unknown = json.loads(ops.unknown_group_action("github_files", "delete_all"))
+    assert unknown["allowed"] == ["list", "get", "put", "push", "delete", "sync"]
+    assert "delete=true" in unknown["hint"]
 
     assert ops.is_blocked_path(".env")
     assert ops.is_blocked_path("./.env")
@@ -262,36 +364,70 @@ def test_ops_dispatch_secret_scanning() -> None:
     # Shouldn't fail with secret detection error
     assert "检测到" not in data.get("error", "")
 
+    # Null content must not become an empty-file write
+    res = asyncio.run(
+        ops.dispatch(
+            client,
+            "push_files",
+            {
+                "owner": "bot",
+                "repo": "toy",
+                "files": [{"path": "MODEL.md", "content": None}],
+                "message": "delete?",
+            },
+            default_private=True,
+            allow_delete_repo=False,
+            allow_merge_pr=True,
+        )
+    )
+    data = json.loads(res)
+    assert "error" in data
+    assert "delete=true" in data["error"]
+
 
 def test_localfs_sandbox(tmp_path: Path | None = None) -> None:
     localfs = _load_localfs()
     ops = _load_ops()
-    root = Path("/tmp/github_ops_localfs_test")
+    cleanup = None
     if tmp_path is not None:
         root = tmp_path
     else:
-        if root.exists():
-            import shutil
+        cleanup = Path(tempfile.mkdtemp(prefix="github_ops_localfs_"))
+        root = cleanup
 
-            shutil.rmtree(root)
-        root.mkdir(parents=True)
-
-    (root / "README.md").write_text("# hi\n", encoding="utf-8")
+    (root / "README.md").write_text("# hi\n", encoding="utf-8", newline="\n")
     (root / "src").mkdir()
-    (root / "src" / "app.py").write_text("print(1)\n", encoding="utf-8")
-    (root / ".env").write_text("SECRET=1\n", encoding="utf-8")
+    (root / "src" / "app.py").write_text("print(1)\n", encoding="utf-8", newline="\n")
+    (root / ".env").write_text("SECRET=1\n", encoding="utf-8", newline="\n")
     (root / "__pycache__").mkdir()
     (root / "__pycache__" / "app.cpython-312.pyc").write_bytes(b"\x00\x01")
     (root / "src" / "skip.bin").write_bytes(b"\x00\xff")
+    (root / "_conf_schema.json").write_text("{}\n", encoding="utf-8", newline="\n")
+    (root / "task_index.json").write_text("{}\n", encoding="utf-8", newline="\n")
+    (root / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+    (root / ".gitignore").write_text(
+        "__pycache__/\n*.py[cod]\n*.json\n!_conf_schema.json\n*.log\n.env\n",
+        encoding="utf-8",
+        newline="\n",
+    )
 
     parsed = localfs.parse_local_root(str(root))
     listed = localfs.list_local_entries(parsed, "")
     paths = {x["path"] for x in listed["entries"]}
     assert "README.md" in paths
     assert "src/app.py" in paths
+    assert "_conf_schema.json" in paths
+    assert "logo.png" in paths
+    assert "task_index.json" not in paths
     assert ".env" not in paths
     assert not any(p.startswith("__pycache__") for p in paths)
     assert "src/skip.bin" not in paths
+    assert listed.get("gitignore") is True
+    gi = localfs.GitIgnore.from_root(parsed)
+    assert gi.ignored("task_index.json")
+    assert not gi.ignored("_conf_schema.json")
+    assert gi.ignored("foo.log")
+    assert not gi.ignored("README.md")
 
     try:
         localfs.parse_local_root("relative/path")
@@ -313,8 +449,23 @@ def test_localfs_sandbox(tmp_path: Path | None = None) -> None:
 
     files = localfs.collect_local_files(parsed, [""])
     collected = {x["path"] for x in files}
-    assert collected == {"README.md", "src/app.py"}
+    assert "README.md" in collected
+    assert "src/app.py" in collected
+    assert "_conf_schema.json" in collected
+    assert "logo.png" in collected
+    assert "task_index.json" not in collected
+    assert ".gitignore" in collected
+    logo = next(x for x in files if x["path"] == "logo.png")
+    assert logo["encoding"] == "base64"
     assert all(x["content"] for x in files)
+    bundle_files, skipped, present = localfs.collect_local_bundle(parsed, [""])
+    assert "src/skip.bin" in present
+    assert any(x["path"] == "src/skip.bin" for x in skipped)
+    try:
+        localfs.read_local_file(parsed, "task_index.json")
+        raise AssertionError("gitignored file should fail")
+    except gc.GitHubError as exc:
+        assert "gitignore" in exc.message.lower() or "忽略" in exc.message
 
     blocked = ops.blocked_paths_in({"local_paths": [".env", "README.md"]})
     assert ".env" in blocked
@@ -328,8 +479,12 @@ def test_localfs_sandbox(tmp_path: Path | None = None) -> None:
         assert "未授予" in exc.message
 
     loaded = ops._load_local_files(parsed, {"local_paths": ["src"]})
-    assert loaded == [{"path": "src/app.py", "content": "print(1)\n"}]
+    assert loaded == [
+        {"path": "src/app.py", "content": "print(1)\n", "encoding": "utf-8"}
+    ]
     assert json.loads(ops.dumps({"ok": True}))["ok"] is True
+    if cleanup is not None:
+        shutil.rmtree(cleanup, ignore_errors=True)
 
 
 if __name__ == "__main__":
@@ -337,6 +492,9 @@ if __name__ == "__main__":
     test_clip_and_brief()
     test_commit_author_identity()
     test_redact_module()
+    test_delete_branch_client_guard()
+    test_branch_name_guards()
+    test_git_blob_sha()
     test_ops_guards()
     test_ops_dispatch_secret_scanning()
     test_localfs_sandbox()

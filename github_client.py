@@ -6,6 +6,7 @@ Never log or return the token.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from typing import Any
 
@@ -33,6 +34,36 @@ def clip_text(text: str, limit: int = MAX_TEXT) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n...[truncated {len(text) - limit} chars]"
+
+
+def git_blob_sha(data: bytes) -> str:
+    header = f"blob {len(data)}\0".encode("utf-8")
+    return hashlib.sha1(header + data, usedforsecurity=False).hexdigest()
+
+
+def normalize_branch_name(branch: str) -> str:
+    text = (branch or "").strip()
+    if text.startswith("refs/heads/"):
+        text = text[len("refs/heads/") :]
+    elif text.startswith("heads/"):
+        text = text[len("heads/") :]
+    return text.strip("/")
+
+
+def is_default_branch(branch: str, default_branch: str) -> bool:
+    name = normalize_branch_name(branch)
+    default = normalize_branch_name(default_branch)
+    return bool(name) and bool(default) and name == default
+
+
+def file_blob_sha(item: dict[str, Any]) -> str:
+    encoding = str(item.get("encoding") or "utf-8")
+    content = item.get("content") or ""
+    if encoding == "base64":
+        raw = base64.b64decode(content)
+    else:
+        raw = str(content).encode("utf-8")
+    return git_blob_sha(raw)
 
 
 def _brief_repo(item: dict[str, Any]) -> dict[str, Any]:
@@ -380,6 +411,7 @@ class GitHubClient:
         content: str,
         message: str,
         branch: str = "",
+        encoding: str = "utf-8",
     ) -> dict[str, Any]:
         owner, repo = await self.resolve_repo(owner, repo)
         if not path:
@@ -396,17 +428,22 @@ class GitHubClient:
             if exc.status != 404:
                 raise
         needles = [self._profile_email] if self._profile_email else None
-        secret_err = find_secret(content, token=self._token, extra_needles=needles)
-        if secret_err:
-            raise GitHubError(400, f"拒绝写入文件 {path}: {secret_err}")
+        if (encoding or "utf-8") != "base64":
+            secret_err = find_secret(content, token=self._token, extra_needles=needles)
+            if secret_err:
+                raise GitHubError(400, f"拒绝写入文件 {path}: {secret_err}")
         secret_err_msg = find_secret(message, token=self._token, extra_needles=needles)
         if secret_err_msg:
             raise GitHubError(400, f"拒绝提交信息: {secret_err_msg}")
+        if (encoding or "utf-8") == "base64":
+            b64 = str(content or "")
+        else:
+            b64 = base64.b64encode((content or "").encode("utf-8")).decode("ascii")
         await self._ensure_identity()
         author = self.get_commit_author()
         body: dict[str, Any] = {
             "message": message or f"update {path}",
-            "content": base64.b64encode((content or "").encode("utf-8")).decode("ascii"),
+            "content": b64,
             "author": author,
             "committer": author,
         }
@@ -421,30 +458,149 @@ class GitHubClient:
             "html_url": (result.get("content") or {}).get("html_url"),
             "commit": commit.get("sha"),
             "commit_url": commit.get("html_url"),
+            "updated": [path],
+            "deleted": [],
+        }
+
+    async def delete_file(
+        self,
+        owner: str,
+        repo: str,
+        path: str,
+        message: str,
+        branch: str = "",
+    ) -> dict[str, Any]:
+        owner, repo = await self.resolve_repo(owner, repo)
+        path = (path or "").lstrip("/")
+        if not path:
+            raise GitHubError(400, "缺少 path")
+        params: dict[str, Any] = {}
+        if branch:
+            params["ref"] = branch
+        try:
+            existing = await self.get(
+                f"/repos/{owner}/{repo}/contents/{path}",
+                **params,
+            )
+        except GitHubError as exc:
+            if exc.status == 404:
+                return {
+                    "deleted": False,
+                    "already_absent": True,
+                    "path": path,
+                    "updated": [],
+                    "deleted": [],
+                }
+            raise
+        if isinstance(existing, list):
+            raise GitHubError(400, f"{path} 是目录，请对具体文件使用 delete")
+        sha = existing.get("sha")
+        if not sha:
+            raise GitHubError(400, f"无法读取 {path} 的 sha")
+        needles = [self._profile_email] if self._profile_email else None
+        secret_err_msg = find_secret(message, token=self._token, extra_needles=needles)
+        if secret_err_msg:
+            raise GitHubError(400, f"拒绝提交信息: {secret_err_msg}")
+        await self._ensure_identity()
+        author = self.get_commit_author()
+        body: dict[str, Any] = {
+            "message": message or f"delete {path}",
+            "sha": sha,
+            "author": author,
+            "committer": author,
+        }
+        if branch:
+            body["branch"] = branch
+        result = await self.delete(f"/repos/{owner}/{repo}/contents/{path}", body)
+        commit = (result or {}).get("commit") or {}
+        return {
+            "deleted": True,
+            "path": path,
+            "commit": commit.get("sha"),
+            "commit_url": commit.get("html_url"),
+            "html_url": commit.get("html_url"),
+            "updated": [],
+            "deleted": [path],
+        }
+
+    async def list_tree_blobs(
+        self,
+        owner: str,
+        repo: str,
+        ref: str = "",
+    ) -> dict[str, Any]:
+        owner, repo = await self.resolve_repo(owner, repo)
+        repo_info = await self.get(f"/repos/{owner}/{repo}")
+        ref_name = ref or repo_info.get("default_branch") or "main"
+        ref_data = await self.get(f"/repos/{owner}/{repo}/git/ref/heads/{ref_name}")
+        commit_sha = (ref_data.get("object") or {}).get("sha")
+        if not commit_sha:
+            raise GitHubError(404, f"分支 {ref_name} 不存在")
+        commit = await self.get(f"/repos/{owner}/{repo}/git/commits/{commit_sha}")
+        tree_sha = (commit.get("tree") or {}).get("sha")
+        tree = await self.get(
+            f"/repos/{owner}/{repo}/git/trees/{tree_sha}",
+            recursive="1",
+        )
+        blobs: dict[str, dict[str, Any]] = {}
+        for item in tree.get("tree") or []:
+            if item.get("type") != "blob":
+                continue
+            p = str(item.get("path") or "")
+            if not p:
+                continue
+            blobs[p] = {
+                "sha": item.get("sha"),
+                "size": item.get("size"),
+                "mode": item.get("mode"),
+            }
+        return {
+            "branch": ref_name,
+            "truncated": bool(tree.get("truncated")),
+            "count": len(blobs),
+            "blobs": blobs,
         }
 
     async def push_files(
         self,
         owner: str,
         repo: str,
-        files: list[dict[str, str]],
+        files: list[dict[str, Any]],
         message: str,
         branch: str = "",
     ) -> dict[str, Any]:
         owner, repo = await self.resolve_repo(owner, repo)
         if not files:
             raise GitHubError(400, "files 为空")
-        cleaned: list[dict[str, str]] = []
+        cleaned: list[dict[str, Any]] = []
         for item in files:
             path = str(item.get("path") or "").lstrip("/")
             if not path:
                 continue
-            cleaned.append({"path": path, "content": str(item.get("content") or "")})
+            if item.get("delete"):
+                cleaned.append({"path": path, "delete": True})
+                continue
+            encoding = str(item.get("encoding") or "utf-8")
+            if "content" not in item or item.get("content") is None:
+                raise GitHubError(
+                    400,
+                    f"{path}: 缺少 content。删文件请设 delete=true，不要省略 content 或传 null",
+                )
+            cleaned.append(
+                {
+                    "path": path,
+                    "content": str(item.get("content")),
+                    "encoding": encoding,
+                    "delete": False,
+                }
+            )
         if not cleaned:
             raise GitHubError(400, "files 里没有有效 path")
 
         needles = [self._profile_email] if self._profile_email else None
         for item in cleaned:
+            if item.get("delete") or item.get("encoding") == "base64":
+                continue
             secret_err = find_secret(item["content"], token=self._token, extra_needles=needles)
             if secret_err:
                 raise GitHubError(400, f"拒绝写入文件 {item['path']}: {secret_err}")
@@ -460,19 +616,35 @@ class GitHubClient:
             if exc.status != 404:
                 raise
             last: dict[str, Any] | None = None
+            updated: list[str] = []
+            deleted: list[str] = []
             for item in cleaned:
-                last = await self.put_file(
-                    owner,
-                    repo,
-                    item["path"],
-                    item["content"],
-                    message or f"update {item['path']}",
-                    branch=branch,
-                )
+                if item.get("delete"):
+                    last = await self.delete_file(
+                        owner,
+                        repo,
+                        item["path"],
+                        message or f"delete {item['path']}",
+                        branch=branch,
+                    )
+                    deleted.extend(last.get("deleted") or [])
+                else:
+                    last = await self.put_file(
+                        owner,
+                        repo,
+                        item["path"],
+                        item["content"],
+                        message or f"update {item['path']}",
+                        branch=branch,
+                        encoding=str(item.get("encoding") or "utf-8"),
+                    )
+                    updated.append(item["path"])
             return {
                 "mode": "contents-api-fallback",
                 "branch": branch,
                 "files": [x["path"] for x in cleaned],
+                "updated": updated,
+                "deleted": deleted,
                 "last": last,
             }
 
@@ -480,7 +652,7 @@ class GitHubClient:
         self,
         owner: str,
         repo: str,
-        files: list[dict[str, str]],
+        files: list[dict[str, Any]],
         message: str,
         branch: str,
     ) -> dict[str, Any]:
@@ -492,9 +664,20 @@ class GitHubClient:
         base_tree = (commit.get("tree") or {}).get("sha")
         tree_items: list[dict[str, Any]] = []
         for item in files:
+            if item.get("delete"):
+                tree_items.append(
+                    {
+                        "path": item["path"],
+                        "mode": "100644",
+                        "type": "blob",
+                        "sha": None,
+                    }
+                )
+                continue
+            encoding = str(item.get("encoding") or "utf-8")
             blob = await self.post(
                 f"/repos/{owner}/{repo}/git/blobs",
-                {"content": item["content"], "encoding": "utf-8"},
+                {"content": item["content"], "encoding": encoding},
             )
             tree_items.append(
                 {
@@ -524,12 +707,16 @@ class GitHubClient:
             f"/repos/{owner}/{repo}/git/refs/heads/{branch}",
             {"sha": new_commit.get("sha")},
         )
+        updated = [x["path"] for x in files if not x.get("delete")]
+        deleted = [x["path"] for x in files if x.get("delete")]
         return {
             "mode": "git-data",
             "branch": branch,
             "commit": new_commit.get("sha"),
             "html_url": new_commit.get("html_url"),
             "files": [x["path"] for x in files],
+            "updated": updated,
+            "deleted": deleted,
         }
 
     async def create_branch(
@@ -554,6 +741,41 @@ class GitHubClient:
             "branch": branch,
             "from": from_branch,
             "sha": (created.get("object") or {}).get("sha"),
+        }
+
+    async def delete_branch(
+        self,
+        owner: str,
+        repo: str,
+        branch: str,
+    ) -> dict[str, Any]:
+        owner, repo = await self.resolve_repo(owner, repo)
+        branch = normalize_branch_name(branch)
+        if not branch:
+            raise GitHubError(400, "缺少 branch")
+        repo_info = await self.get(f"/repos/{owner}/{repo}")
+        default_branch = normalize_branch_name(
+            str(repo_info.get("default_branch") or "main")
+        )
+        if is_default_branch(branch, default_branch):
+            raise GitHubError(403, f"禁止删除默认分支 {default_branch}")
+        try:
+            await self.delete(f"/repos/{owner}/{repo}/git/refs/heads/{branch}")
+        except GitHubError as exc:
+            if exc.status == 404:
+                return {
+                    "deleted": False,
+                    "already_absent": True,
+                    "branch": branch,
+                    "default_branch": default_branch,
+                    "full_name": f"{owner}/{repo}",
+                }
+            raise
+        return {
+            "deleted": True,
+            "branch": branch,
+            "default_branch": default_branch,
+            "full_name": f"{owner}/{repo}",
         }
 
     async def list_commits(

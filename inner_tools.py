@@ -47,7 +47,9 @@ class GitHubRepoTool(FunctionTool[AstrAgentContext]):
     name: str = "github_repo"
     description: str = (
         "Bot GitHub repos. action=list|get|create|delete|commits. "
-        "create uses name/description/private. delete is often disabled."
+        "create uses name/description/private. "
+        "delete here means delete the whole repository (often disabled); "
+        "to delete a file use github_files action=delete."
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -86,8 +88,8 @@ class GitHubLocalTool(FunctionTool[AstrAgentContext]):
     name: str = "github_local"
     description: str = (
         "Read the granted local_dir only. action=list|get. "
-        "Paths must stay under that directory. No file body in GitHub writes; "
-        "use github_files local_paths to push."
+        "list applies .gitignore. Paths must stay under that directory. "
+        "To push, use github_files local_paths or action=sync; do not paste file bodies."
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -116,9 +118,11 @@ class GitHubLocalTool(FunctionTool[AstrAgentContext]):
 class GitHubFilesTool(FunctionTool[AstrAgentContext]):
     name: str = "github_files"
     description: str = (
-        "Read or write files in a repo. action=list|get|put|push. "
-        "Prefer local_paths from the granted local_dir; do not paste file bodies. "
-        "put=one inline file; push=files[] or local_paths."
+        "Read or write files in a repo. action=list|get|put|push|delete|sync. "
+        "Prefer local_paths / sync; do not paste file bodies. "
+        "delete removes one file (NOT the repo). "
+        "To delete in push: files=[{path, delete:true}]. Never omit content or pass null. "
+        "sync aligns the granted local_dir; whole-tree default also deletes remote extras."
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -126,14 +130,18 @@ class GitHubFilesTool(FunctionTool[AstrAgentContext]):
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "list | get | put | push",
+                    "enum": ["list", "get", "put", "push", "delete", "sync"],
+                    "description": "list | get | put | push | delete | sync",
                 },
                 "repo": {"type": "string", "description": "Repo name or owner/repo."},
                 "owner": {"type": "string", "description": "Owner. Omit for bot login."},
-                "path": {"type": "string", "description": "File or directory path."},
+                "path": {
+                    "type": "string",
+                    "description": "File or directory path. Required for get/put/delete.",
+                },
                 "content": {
                     "type": "string",
-                    "description": "Inline text for put. Skip if using local_path.",
+                    "description": "Inline text for put. Skip if using local_path. Do not use null to delete.",
                 },
                 "local_path": {
                     "type": "string",
@@ -141,19 +149,30 @@ class GitHubFilesTool(FunctionTool[AstrAgentContext]):
                 },
                 "local_paths": {
                     "type": "array",
-                    "description": "push: relative files or dirs under granted local_dir.",
+                    "description": "push/sync: relative files or dirs under granted local_dir.",
                     "items": {"type": "string"},
                 },
                 "message": {"type": "string", "description": "Commit message."},
-                "branch": {"type": "string", "description": "Branch or ref."},
+                "branch": {
+                    "type": "string",
+                    "description": "Branch or ref. Omit to use the default branch. Do not create extra branches to experiment.",
+                },
+                "delete_extra": {
+                    "type": "boolean",
+                    "description": "sync: delete remote files missing locally. Default true for whole-tree, false for specific paths.",
+                },
                 "files": {
                     "type": "array",
-                    "description": "push: [{path, content}, ...] only if no local_paths.",
+                    "description": "push: [{path, content}] or [{path, delete:true}]. Never omit content to delete.",
                     "items": {
                         "type": "object",
                         "properties": {
                             "path": {"type": "string"},
                             "content": {"type": "string"},
+                            "delete": {
+                                "type": "boolean",
+                                "description": "If true, delete this path from the repo.",
+                            },
                         },
                         "required": ["path"],
                     },
@@ -237,19 +256,29 @@ class GitHubMiscTool(FunctionTool[AstrAgentContext]):
     name: str = "github_misc"
     description: str = (
         "fork (owner/repo is the source; forks into the bot account), "
-        "star, or create a branch. action=fork|star|branch."
+        "star, create a branch, or delete a branch. "
+        "action=fork|star|branch|delete_branch. "
+        "delete_branch cannot remove the repository default branch. "
+        "Do not create a test branch unless the user asked for one."
     )
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "description": "fork | star | branch"},
+                "action": {
+                    "type": "string",
+                    "enum": ["fork", "star", "branch", "delete_branch"],
+                    "description": "fork | star | branch | delete_branch",
+                },
                 "owner": {
                     "type": "string",
                     "description": "Source owner for fork/star. Omit for bot login.",
                 },
                 "repo": {"type": "string", "description": "Repo name or owner/repo."},
-                "branch": {"type": "string", "description": "New branch name for branch."},
+                "branch": {
+                    "type": "string",
+                    "description": "branch: new name. delete_branch: name to delete (not the default branch).",
+                },
                 "from_branch": {
                     "type": "string",
                     "description": "Source branch for branch. Default default_branch.",

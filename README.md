@@ -94,6 +94,26 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_github_ops
 - `github_local`：读已授权本地目录
 - `github_issue` / `github_pr` / `github_misc`：协作与 fork / star / 建分支 / 删分支（不能删默认分支）
 
+## 更新日志
+
+完整记录见 [CHANGELOG.md](CHANGELOG.md)。
+
+### 0.5.1
+
+- 新增删分支：`github_misc action=delete_branch`
+- 禁止删除仓库默认分支；已不存在的分支返回 `already_absent`
+
+### 0.5.0
+
+- 支持删文件：`github_files action=delete`，以及 `push`/`sync` 的 `files[].delete=true`
+- 新增 `sync`：按本地目录对齐远端，整目录默认同步并删除多余文件
+- 空 / `null` content 不再写成空文件
+- 未知 action 返回 `allowed` 和用法说明
+- `github_local` list / 推送默认尊重 `.gitignore`
+- png 等资源可按二进制 blob 推送；push 结果区分 `updated` / `deleted`
+- 配置项 `max_steps`（默认 24）；身份预注入子循环
+- 子循环遇到意外情况直接汇报，不再猜 action 或另开测试分支
+
 ## 许可证
 
 本项目基于 [MIT License](LICENSE) 开源。

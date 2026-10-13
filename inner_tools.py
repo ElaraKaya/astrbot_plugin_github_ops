@@ -88,8 +88,8 @@ class GitHubLocalTool(FunctionTool[AstrAgentContext]):
     name: str = "github_local"
     description: str = (
         "Read the granted local_dir only. action=list|get. "
-        "list applies .gitignore. Paths must stay under that directory. "
-        "To push, use github_files local_paths or action=sync; do not paste file bodies."
+        "If the prompt says local_dir=none, do not call this tool. "
+        "list applies .gitignore. Paths must stay under that directory."
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -118,11 +118,11 @@ class GitHubLocalTool(FunctionTool[AstrAgentContext]):
 class GitHubFilesTool(FunctionTool[AstrAgentContext]):
     name: str = "github_files"
     description: str = (
-        "Read or write files in a repo. action=list|get|put|push|delete|sync. "
-        "Prefer local_paths / sync; do not paste file bodies. "
+        "Read or write a remote GitHub repo. action=list|get|put|push|delete|sync. "
+        "No local_dir: use list/get/put/push/delete only. "
+        "local_paths and sync require a granted local_dir; do not call them otherwise. "
         "delete removes one file (NOT the repo). "
-        "To delete in push: files=[{path, delete:true}]. Never omit content or pass null. "
-        "sync aligns the granted local_dir; whole-tree default also deletes remote extras."
+        "To delete in push: files=[{path, delete:true}]. Never omit content or pass null."
     )
     parameters: dict = Field(
         default_factory=lambda: {

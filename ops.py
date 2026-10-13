@@ -214,8 +214,11 @@ def repo_write_allowed(
     login: str,
     owner: str,
     repo: str,
-    allowed_repos: list[str],
+    allowed_repos: list[str] | None = None,
+    allow_all: bool = False,
 ) -> bool:
+    if allow_all:
+        return True
     owner = (owner or login).strip().strip("/")
     repo = (repo or "").strip().strip("/")
     if "/" in repo and not owner:
@@ -223,7 +226,9 @@ def repo_write_allowed(
     owner_l = owner.lower()
     repo_l = repo.lower()
     login_l = (login or "").lower()
-    allow = [str(x).strip() for x in allowed_repos if str(x).strip()]
+    allow = [str(x).strip() for x in (allowed_repos or []) if str(x).strip()]
+    if "*" in allow or "all" in [x.lower() for x in allow]:
+        return True
     if not allow:
         return bool(owner_l) and owner_l == login_l
     full = f"{owner_l}/{repo_l}" if repo_l else owner_l

@@ -265,6 +265,12 @@ def test_ops_guards() -> None:
         login="bot", owner="octocat", repo="Hello-World", allowed_repos=[]
     )
     assert ops.repo_write_allowed(
+        login="bot", owner="octocat", repo="Hello-World", allow_all=True
+    )
+    assert ops.repo_write_allowed(
+        login="bot", owner="octocat", repo="Hello-World", allowed_repos=["*"]
+    )
+    assert ops.repo_write_allowed(
         login="bot",
         owner="bot",
         repo="toy",

@@ -46,17 +46,11 @@
     "type": "bool",
     "default": true
   },
-  "max_steps": {
-    "description": "子循环最大工具步数",
-    "type": "int",
-    "hint": "默认 24（范围 4–60）。同步目录大约 4–8 步；过小会在中途被强制结束。",
-    "default": 24
-  },
-  "allowed_repos": {
-    "description": "可写仓库白名单",
-    "type": "list",
-    "hint": "空=只能写 bot 自己 login 下的仓。可填 login 或 owner/repo。fork 源仓、star、只读不受这项限制。",
-    "default": []
+  "allow_all_repos": {
+    "description": "允许写入所有仓库 (ALL)",
+    "type": "bool",
+    "hint": "关=只能写 bot 自己名下的仓库；开=解除限制，允许向任意仓库写代码或提 PR。",
+    "default": false
   },
   "git_committer_name": {
     "description": "Git 提交者显示名称",

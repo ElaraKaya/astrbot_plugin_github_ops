@@ -3,6 +3,32 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## 0.6.2 - 2026-10-12
+
+### 变更
+
+- 代码修改改由调用方完成。子循环只按 task 里的完整正文或 local_dir 原样提交，不再负责读懂后再改
+
+## 0.6.1 - 2026-10-12
+
+### 修复
+
+- 没传 `local_dir` 时向子循环写明仓库在 GitHub 远端，禁止调用 `github_local`、`sync` 和 `local_paths`
+- `github_files` 说明改为远端读写优先，避免子循环误去列本地目录
+
+## 0.6.0 - 2026-10-12
+
+### 变更
+
+- 删除配置项 `max_steps`。子循环步数上限改由 `github_ops` 的 `max_steps` 参数传入，必填，范围 1–30
+- 该上限会写进子循环提示，要求在步数内结束并汇报
+- 收紧子循环：禁止重复读取，禁止浏览任务没点名的文件、PR、issue、commit
+- 外层工具说明改为一次只做一件事，并注明整次调用 120 秒硬超时，复杂任务需拆分
+
+### 不兼容
+
+- 调用 `github_ops` 时必须传 `max_steps`，缺省或超出 1–30 会直接拒绝
+
 ## 0.5.1 - 2026-09-16
 
 ### 新增

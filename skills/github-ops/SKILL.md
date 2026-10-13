@@ -1,25 +1,27 @@
 ---
 name: github-ops
 description: >
-  Execute GitHub tasks using the configured GitHub account. For any GitHub work,
-  call github_ops(task=the full job, local_dir=absolute path when pushing
-  local files). Do not split into granular actions. Read this skill before the
-  first GitHub action.
+  Execute one GitHub task with the configured account. Call
+  github_ops(task=one concrete job, max_steps=1-30, local_dir=absolute path
+  when pushing local files). The whole call times out at 120 seconds, so split
+  complex work into separate calls. Read this skill before the first GitHub action.
 ---
 
 # GitHub Ops
 
 通过配置的 GitHub 账号执行仓库管理与协作操作。
 
-主对话只调 **一次** `github_ops`：
+一次调用只做一件事。复杂任务拆开，分多次调。整次调用 120 秒硬超时，超时会被取消。
 
 ```
-github_ops(task="完整任务", local_dir="/abs/path")
+github_ops(task="一件具体的事", max_steps=6, local_dir="/abs/path")
 ```
 
-推本地源码时 **只传目录路径**，不要把文件正文塞进 task。子循环只能读这个目录，越界会拒。没有本地目录、只改几个小文件时，才把正文写进 task。
+`max_steps` 必填，范围 1–30，会原样传给子循环。查一件事填 2–4，改一个文件填 4–8。
 
-不要自己拆 action，也不要找 MCP 里的 `create_repository`。子循环看不到聊天记录，所以 **task 必须自包含**。
+改代码在调用前完成。子循环只提交，不负责读懂再改。小文件把完整新正文写进 task；文件多或已经在本地改好，传 local_dir，不要再抄正文。子循环只能读这个目录，越界会拒。
+
+不要自己拆底层 action，也不要找 MCP 里的 `create_repository`。子循环看不到聊天记录，所以 **task 必须自包含**。
 
 ## 规则
 

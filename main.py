@@ -48,42 +48,40 @@ except ImportError:  # pragma: no cover - fallback across AstrBot layouts
 _local_root_var: ContextVar[Path | None] = ContextVar("github_ops_local_root", default=None)
 
 INNER_SYSTEM_PROMPT = (
-    "执行 GitHub 相关任务。用工具干活。"
-    "身份已在任务里给出，不必先调 github_whoami。"
-    "只回摘要和 html_url。"
-    "严禁输出 token / PAT / Authorization。"
-    "工具若返回 [REDACTED] 不要试图还原。"
-    "没要求就别把文件正文或 issue 全文丢回来。"
-    "task 已自包含，不要假设还有聊天记录。"
-    "fork 的 owner 是源仓；写入目标默认是当前登录账号。"
-    "若已授予 local_dir：github_local 只能读这个目录（list 已按 .gitignore 过滤）；"
-    "推仓用 github_files 的 sync 或 local_paths，不要把文件正文再抄一遍。"
-    "删文件用 github_files action=delete，或 push/sync 时 files[].delete=true。"
-    "这与删仓无关；github_repo action=delete 才会删整个仓库，且通常禁止。"
+    "只做 task 里写明的事，做完立刻停。"
+    "外层负责读代码和改代码，子循环只做 GitHub 写入与执行。"
+    "task 给了完整新正文就原样 put/push；给了 local_dir 就原样 sync。禁止重写、补全或再思考改法。"
+    "写入直接 put/push/sync，不要先建实验分支。"
+    "身份已给出，不必调 github_whoami。"
+    "只回摘要和 html_url。严禁输出 token / PAT / Authorization。[REDACTED] 不要还原。"
+    "fork 的 owner 是源仓；写入目标默认是当前登录账号。白名单空时只能写当前登录账号自己的仓库。"
+    "仓库在 GitHub 远端，远端只用 github_files。没有浏览器、curl、git clone。"
+    "没传 local_dir 时写明 local_dir=none，禁止调用 github_local，禁止 sync 和 local_paths。"
+    "有 local_dir 时只读该目录，推仓用 sync 或 local_paths，不要抄正文。"
+    "删文件用 github_files action=delete；删仓才是 github_repo action=delete，通常禁止。"
     "删分支用 github_misc action=delete_branch，禁止删默认分支。"
-    "不要为了试 API 另开分支；用户没要求就写默认分支。"
-    "遇到工具报错、未知 action、缺参数、结果与任务不符："
-    "立刻停止试探，在最终回复里如实汇报原因。禁止改 action 名乱猜，"
-    "禁止建实验分支，禁止把文件写成空内容来模拟删除。"
+    "报错、未知 action、缺参数或结果不符：立刻停，在最终回复如实汇报。禁止改 action 名乱猜，禁止写空文件冒充删除。"
 )
 
-INNER_INCIDENT_PROMPT = (
+INNER_RULES = (
     "[运行规则]\n"
-    "身份已确认，不必调 github_whoami。\n"
-    "意外情况（工具报错、未知 action、缺参数、结果和任务不符）立刻停止试探，"
-    "在最终回复如实汇报，不要换 action 名乱猜，不要另开测试分支，"
-    "不要把文件写成空内容来模拟删除。\n"
-    "删文件：github_files action=delete，或 push/sync 的 files.delete=true。"
-    "这与配置里的 allow_delete_repo（删整个仓库）无关。\n"
-    "删分支：github_misc action=delete_branch，不能删默认分支。\n"
-    "有 local_dir 时优先 github_files action=sync（整目录）或 local_paths。"
+    "本次最多 {max_steps} 步（含每次工具调用）。步数用尽前结束并汇报做了什么、没做成什么。\n"
+    "外层负责读代码和改代码，子循环只做 GitHub 写入。禁止让子循环找到某逻辑再改。\n"
+    "task 给出完整新正文时原样 put/push；给出 local_dir 时原样 sync。不要重写代码，不要先读再改。\n"
+    "仓库在 GitHub 远端，远端只用 github_files。没有浏览器、curl、git clone。\n"
+    "没传 local_dir 时为 local_dir=none，禁止调用 github_local，禁止 sync 和 local_paths。\n"
+    "有 local_dir 时只读该目录，推仓用 sync 或 local_paths，不要抄正文。\n"
+    "删文件用 github_files action=delete，或 push/sync 的 files.delete=true。与 allow_delete_repo 无关。\n"
+    "删分支用 github_misc action=delete_branch，禁止删默认分支。\n"
+    "报错、未知 action、缺参数或结果不符立刻停，如实汇报，禁止改 action 名乱猜，禁止写空文件冒充删除。"
 )
 
 TOOL_DESCRIPTION = (
-    "Execute GitHub tasks with configured GitHub account. "
-    "Pass the whole job in task. For local source trees, pass local_dir "
-    "(absolute path) instead of file bodies. Do not split into GitHub "
-    "actions yourself. Never print the token."
+    "用配置好的 GitHub 账号做一件具体的事。一次调用只做一件，复杂任务先拆开再调。"
+    "整次调用硬超时 120 秒，超时会被取消。"
+    "绝对不要使用本工具读取或直接修改远端仓库内容；涉及查看或修改仓库内容时，请先下载到本地工作空间处理，或使用 web 工具查看。修改完成后通过 local_dir 将本地目录原样 sync 推送到远端。"
+    "子循环没有浏览器、curl、git clone，没传 local_dir 时禁止本地操作。"
+    "max_steps 必填，范围 1–30，纯写入填 2 到 4。不要自己拆成底层 GitHub action。不要输出 token。"
 )
 
 
@@ -108,20 +106,24 @@ class GitHubOpsTool(FunctionTool[AstrAgentContext]):
                 "task": {
                     "type": "string",
                     "description": (
-                        "Self-contained GitHub task for the bot's account. "
-                        "Include repo names. Prefer local_dir over file bodies. "
-                        "The inner loop cannot see QQ/chat history."
+                        "一件具体的 GitHub 操作，必须自包含。绝对不要用本工具读取或直接修改远端仓库内容；"
+                        "查看或修改代码请下载到本地工作空间或用 web 工具，本地改完后传 local_dir 原样 sync 推送。"
                     ),
                 },
                 "local_dir": {
                     "type": "string",
                     "description": (
-                        "Optional absolute directory the inner loop may read. "
-                        "Paths outside it are rejected. Use this to push local files."
+                        "可选。本地绝对目录。有 local_dir 则原样 sync，不要把正文塞进 task；未传时为 none，禁止本地操作。"
+                    ),
+                },
+                "max_steps": {
+                    "type": "integer",
+                    "description": (
+                        "必填。子循环步数上限，范围 1 到 30。纯写入填 2 到 4。"
                     ),
                 },
             },
-            "required": ["task"],
+            "required": ["task", "max_steps"],
         }
     )
 
@@ -138,6 +140,7 @@ class GitHubOpsTool(FunctionTool[AstrAgentContext]):
             event,
             str(kwargs.get("task") or ""),
             str(kwargs.get("local_dir") or ""),
+            kwargs.get("max_steps"),
         )
 
 
@@ -211,13 +214,17 @@ class GitHubOpsPlugin(Star):
         value = str(self.config.get("who_can_use") or "admin").strip().lower()
         return value if value in {"admin", "all"} else "admin"
 
-    def _max_steps(self) -> int:
-        raw = self.config.get("max_steps", 24)
+    def _parse_max_steps(self, raw: Any) -> int | None:
         try:
             n = int(raw)
         except (TypeError, ValueError):
-            n = 24
-        return min(max(n, 4), 60)
+            return None
+        if n < 1 or n > 30:
+            return None
+        return n
+
+    def _allow_all_repos(self) -> bool:
+        return bool(self.config.get("allow_all_repos", False))
 
     def _allowed_repos(self) -> list[str]:
         raw = self.config.get("allowed_repos") or []
@@ -268,13 +275,14 @@ class GitHubOpsPlugin(Star):
                 owner=owner,
                 repo=repo,
                 allowed_repos=self._allowed_repos(),
+                allow_all=self._allow_all_repos(),
             ):
                 return dumps(
                     {
-                        "error": "写入目标不在白名单",
+                        "error": "目标仓库未授权写入",
                         "owner": owner or login,
                         "repo": repo,
-                        "hint": "allowed_repos 为空时只能写入当前登录账号下的仓库",
+                        "hint": "当前仅允许写入当前登录账号下的仓库。可在插件配置开启【允许写入所有仓库】",
                     }
                 )
         res = await dispatch(
@@ -297,6 +305,7 @@ class GitHubOpsPlugin(Star):
         event: AstrMessageEvent,
         task: str,
         local_dir: str = "",
+        max_steps: Any = None,
     ) -> str:
         if not self._allowed(event):
             return dumps({"error": "无权调用 GitHub 功能（权限受限：who_can_use=admin）"})
@@ -306,6 +315,9 @@ class GitHubOpsPlugin(Star):
         task = (task or "").strip()
         if not task:
             return dumps({"error": "task 为空。把完整 GitHub 任务写进 task。需要推本地文件就加 local_dir。"})
+        steps = self._parse_max_steps(max_steps)
+        if steps is None:
+            return dumps({"error": "max_steps 必填，且必须是 1 到 30 的整数"})
 
         try:
             local_root = parse_local_root(local_dir) if local_dir.strip() else None
@@ -325,12 +337,23 @@ class GitHubOpsPlugin(Star):
             f"[bot GitHub login={login} html_url={me.get('html_url')} "
             f"rate={rate.get('remaining')}/{rate.get('limit')}]"
         )
-        prompt_parts = [task.strip(), "", identity_block, INNER_INCIDENT_PROMPT]
+        prompt_parts = [
+            task.strip(),
+            "",
+            identity_block,
+            INNER_RULES.format(max_steps=steps),
+        ]
         if local_root is not None:
             prompt_parts.append(
                 f"[granted local_dir={local_root}]\n"
                 "只读这个目录。推仓用 github_files action=sync 或 local_paths，不要抄文件正文。"
                 "list 已按 .gitignore 过滤。"
+            )
+        else:
+            prompt_parts.append(
+                "[local_dir=none]\n"
+                "没有本地目录。仓库在 GitHub 远端，远端只用 github_files。没有浏览器、curl、git clone。\n"
+                "禁止调用 github_local，禁止 sync 和 local_paths。"
             )
         prompt = "\n".join(prompt_parts)
 
@@ -344,7 +367,7 @@ class GitHubOpsPlugin(Star):
                 "prompt": prompt,
                 "system_prompt": INNER_SYSTEM_PROMPT,
                 "tools": _make_tool_set(build_inner_tools()),
-                "max_steps": self._max_steps(),
+                "max_steps": steps,
                 "tool_call_timeout": 120,
             }
             try:
@@ -411,7 +434,7 @@ class GitHubOpsPlugin(Star):
             "proxy: {proxy}\n"
             "committer: {committer}\n"
             "who_can_use: {who}\n"
-            "max_steps: {steps}\n"
+            "max_steps: 由调用时传入（1-30）\n"
             "allowed_repos: {allow}".format(
                 login=me.get("login"),
                 url=me.get("html_url"),
@@ -422,7 +445,6 @@ class GitHubOpsPlugin(Star):
                 proxy=client.proxy_display() or "(空=环境变量 HTTP(S)_PROXY)",
                 committer=f"{client.get_commit_author()['name']} <{'(custom)' if self.config.get('git_committer_email') else 'noreply'}>",
                 who=self._who_can_use(),
-                steps=self._max_steps(),
-                allow=", ".join(self._allowed_repos()) or "(空=只写自己的 login)",
+                allow="ALL (全部仓库)" if self._allow_all_repos() else (", ".join(self._allowed_repos()) or "(仅限自己账号)"),
             )
         )

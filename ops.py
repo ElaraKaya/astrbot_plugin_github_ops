@@ -214,8 +214,11 @@ def repo_write_allowed(
     login: str,
     owner: str,
     repo: str,
-    allowed_repos: list[str],
+    allowed_repos: list[str] | None = None,
+    allow_all: bool = False,
 ) -> bool:
+    if allow_all:
+        return True
     owner = (owner or login).strip().strip("/")
     repo = (repo or "").strip().strip("/")
     if "/" in repo and not owner:
@@ -223,7 +226,9 @@ def repo_write_allowed(
     owner_l = owner.lower()
     repo_l = repo.lower()
     login_l = (login or "").lower()
-    allow = [str(x).strip() for x in allowed_repos if str(x).strip()]
+    allow = [str(x).strip() for x in (allowed_repos or []) if str(x).strip()]
+    if "*" in allow or "all" in [x.lower() for x in allow]:
+        return True
     if not allow:
         return bool(owner_l) and owner_l == login_l
     full = f"{owner_l}/{repo_l}" if repo_l else owner_l
@@ -625,12 +630,14 @@ def normalize_empty(path: str) -> bool:
 
 def help_text() -> str:
     return (
-        "主对话只调 github_ops(task=完整任务, local_dir=可选绝对路径)。"
+        "主对话只调 github_ops(task=完整任务, max_steps=1-30, local_dir=可选绝对路径)。"
+        " 外层负责读改代码，子循环只做写入。"
         " 子循环工具: github_whoami, github_repo, github_local, github_files, "
         "github_issue, github_pr, github_misc。"
-        " github_files: list/get/put/push/delete/sync。"
+        " github_files: list/get/put/push/delete/sync。远端只用 github_files。"
+        " 没传 local_dir 时为 local_dir=none，禁止本地操作。"
         " 删文件用 delete，与删仓无关。"
         " 删分支用 github_misc action=delete_branch，不能删默认分支。"
         " 有 local_dir 就 sync 或 local_paths，不要抄文件正文。"
-        " 默认 owner 为当前登录的 GitHub 账号。严禁输出 token。"
+        " 默认 owner 为当前登录账号，白名单空时只能写自己名下的仓库。严禁输出 token。"
     )

@@ -1,11 +1,17 @@
 import asyncio
 import importlib.util
 import json
+import os
 import shutil
 import sys
 import tempfile
 import types
 from pathlib import Path
+
+# Sanitize httpx IPv6 NO_PROXY parsing in sandboxes
+for _k in ("NO_PROXY", "no_proxy"):
+    if _k in os.environ and "[::1]" in os.environ[_k]:
+        os.environ[_k] = os.environ[_k].replace(",[::1]", "").replace("[::1]", "")
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -263,6 +269,12 @@ def test_ops_guards() -> None:
     )
     assert not ops.repo_write_allowed(
         login="bot", owner="octocat", repo="Hello-World", allowed_repos=[]
+    )
+    assert ops.repo_write_allowed(
+        login="bot", owner="octocat", repo="Hello-World", allow_all=True
+    )
+    assert ops.repo_write_allowed(
+        login="bot", owner="octocat", repo="Hello-World", allowed_repos=["*"]
     )
     assert ops.repo_write_allowed(
         login="bot",

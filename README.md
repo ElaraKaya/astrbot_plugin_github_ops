@@ -4,12 +4,12 @@
 
 - 插件名：`astrbot_plugin_github_ops`
 - 作者：Elara
-- 版本：0.5.1
+- 版本：0.6.4
 - 需要 AstrBot `>=4.5.7`
 
-主对话只注册一个函数工具 `github_ops(task, local_dir?)`。真正的建仓 / 提交 / issue / fork / PR 在子循环里用内层工具完成，**不会**把几十个工具和海量 schema 灌进每轮主对话上下文。
+主对话只注册一个函数工具 `github_ops(task, max_steps, local_dir?)`。真正的建仓 / 提交 / issue / fork / PR 在子循环里用内层工具完成，**不会**把几十个工具和海量 schema 灌进每轮主对话上下文。
 
-推本地源码时传 `local_dir`（绝对路径）。子循环只能读这个目录，插件原生读取文件并推送 GitHub，无需模型抄录文件正文。
+外层负责读代码和改代码。子循环只做 GitHub 写入：task 里给了完整新正文就原样 put/push；给了 `local_dir`（绝对路径）就原样 sync。禁止让子循环“找到某逻辑再改”，否则会撞上 120 秒硬超时。
 
 ## 介绍
 
@@ -69,8 +69,7 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_github_ops
 | `default_private` | 新建仓库默认私有 |
 | `allow_delete_repo` | 是否允许**删整个仓库**。默认关。不影响删文件 |
 | `allow_merge_pr` | 是否允许合并 PR |
-| `max_steps` | 子循环最大工具步数，默认 24（范围 4–60） |
-| `allowed_repos` | 可写仓库白名单。空=只能写当前登录账号名下的仓 |
+| `allowed_repos` | 可写仓库白名单。空=只能写当前登录账号名下的仓库 |
 
 ## 使用
 
@@ -78,7 +77,7 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_github_ops
 
 自然语言示例：「建一个 private 仓 `toy-notes`，README 写一句话，把链接给我」。
 
-模型应调用 `github_ops(task=完整任务)`。需要推本地目录时再加 `local_dir=/abs/path`。`task` 必须自包含；有 `local_dir` 时无需塞入文件正文。
+模型应调用 `github_ops(task=一件具体的事, max_steps=整数)`。`max_steps` 必填，范围 1–30，纯写入填 2–4。整次调用硬超时 120 秒，一次只做一件事，复杂任务拆开分多次调。外层负责读改代码，子循环只做写入（完整正文原样 put/push，本地目录原样 sync）。子循环没有浏览器、curl、git clone，远端只用 `github_files`。没传 `local_dir` 时写明 `local_dir=none`，禁止本地操作。白名单空时只能写当前登录账号自己的仓库。
 
 同步本地插件目录、并删掉仓库里多出来的文件时，直接把这件事写进 `task` 即可。子循环会用 `github_files action=sync`（或 `delete` / `push` + `files[].delete=true`），不要把文件写成空内容来“假装删除”。
 
@@ -97,6 +96,26 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_github_ops
 ## 更新日志
 
 完整记录见 [CHANGELOG.md](CHANGELOG.md)。
+
+### 0.6.4
+
+- 更新外层工具说明（`TOOL_DESCRIPTION`、`task` 参数描述与 `SKILL.md`）：明确禁止使用本工具读取或直接修改远端仓库内容；查看或修改仓库内容请先下载到本地工作空间或使用 web 工具，修改完成后通过 `local_dir` 原样 `sync` 推送到远端
+
+### 0.6.3
+
+- 严格统一外层工具说明、内层系统提示、运行规则、SKILL 与 README 分工表述
+- 外层负责读改代码，子循环只做 GitHub 写入（完整正文原样 put/push，local_dir 原样 sync），禁止让子循环“找到某逻辑再改”
+- 统一步数建议：纯写入填 2–4 步，删除相互打架的 4–8 步与探索提示
+- 声明子循环无浏览器/curl/git clone，远端只用 github_files；没传 local_dir 时为 local_dir=none 并禁用本地操作
+- 核对并同步 inner_tools、ops、main、localfs 参数定义与行为
+- 明确白名单为空时只能写入当前登录账号自己的仓库
+
+### 0.6.0
+
+- 删除配置项 `max_steps`，改由调用 `github_ops` 时必填传入（1–30）
+- 步数上限写进子循环提示，要求在步数内结束并汇报
+- 收紧子循环，禁止重复读取和浏览任务没点名的内容
+- 外层工具说明注明一次一件事，整次调用 120 秒硬超时
 
 ### 0.5.1
 
